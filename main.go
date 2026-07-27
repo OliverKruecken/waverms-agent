@@ -43,8 +43,8 @@ func main() {
 	}
 
 	// WaitForBrokerHost polls /etc/waverms/config and the DHCP overlay
-	// /etc/waverms/dhcp (written by /etc/udhcpc.d/60-waverms-bootstrap from
-	// option 225) until BROKER_HOST is non-empty or 120 s elapse.
+	// /etc/waverms/dhcp (written by /etc/udhcpc.user.d/60-waverms-bootstrap
+	// from option 225) until BROKER_HOST is non-empty or 120 s elapse.
 	cfg, err := config.WaitForBrokerHost("/etc/waverms/config", "/etc/waverms/dhcp", 120*time.Second)
 	if err != nil {
 		log.Fatalf("config: %v", err)
