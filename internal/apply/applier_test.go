@@ -497,6 +497,74 @@ func TestServiceReloads_NoDuplicates(t *testing.T) {
 	assert.Len(t, cmds, 1)
 }
 
+func TestApply_ReplaceMode_DeletesEntireUnlistedSectionType(t *testing.T) {
+	// Regression (waverms.moortwiete.de, wrt-roof): a firewall template with
+	// ".mode":"replace" that only lists "defaults" left "rule" and "zone" sections
+	// untouched on the device, because stagePackage()'s per-type loop only ever
+	// visited section types present in the payload — even in replace mode. Docs
+	// say ".mode":"replace" means "wipe + rewrite" the whole package; the fix makes
+	// replace mode delete every existing section of ANY type not kept by the payload.
+	mock := &uci.MockUCIRunner{
+		Results: map[string]string{
+			"show firewall": strings.Join([]string{
+				"firewall.@defaults[0]=defaults",
+				"firewall.@rule[0]=rule",
+				"firewall.@rule[0].name='Allow-Ping'",
+				"firewall.@zone[0]=zone",
+				"firewall.@zone[0].name='lan'",
+			}, "\n"),
+		},
+	}
+	a := apply.New(mock)
+
+	cfg := `{
+  "firewall": {
+    ".mode": "replace",
+    "defaults": { "input": "ACCEPT", "output": "ACCEPT", "forward": "ACCEPT" }
+  }
+}`
+	_, err := a.Apply(json.RawMessage(cfg))
+	require.NoError(t, err)
+
+	assert.Contains(t, mock.Calls, "delete firewall.@rule[0]",
+		"rule section must be deleted even though the template never mentions the rule type")
+	assert.Contains(t, mock.Calls, "delete firewall.@zone[0]",
+		"zone section must be deleted even though the template never mentions the zone type")
+	assert.Contains(t, mock.Calls, "delete firewall.@defaults[0]",
+		"old anonymous defaults section must be deleted before the new one is added")
+	assert.Contains(t, mock.Calls, "add firewall defaults")
+}
+
+func TestApply_ReplaceMode_UnlistedTypeKeepsNamedSectionFromListedType(t *testing.T) {
+	// A named section kept by one listed section type must survive the whole-package
+	// sweep even though it's discovered via a different existingSectionTypes() entry.
+	mock := &uci.MockUCIRunner{
+		Results: map[string]string{
+			"show firewall": strings.Join([]string{
+				"firewall.lan=zone",
+				"firewall.@rule[0]=rule",
+				"firewall.@rule[0].name='Allow-Ping'",
+			}, "\n"),
+		},
+	}
+	a := apply.New(mock)
+
+	cfg := `{
+  "firewall": {
+    ".mode": "replace",
+    "zone": [{ ".name": "lan", "input": "ACCEPT" }]
+  }
+}`
+	_, err := a.Apply(json.RawMessage(cfg))
+	require.NoError(t, err)
+
+	assert.NotContains(t, mock.Calls, "delete firewall.lan",
+		"named zone section listed in the template must be kept")
+	assert.Contains(t, mock.Calls, "delete firewall.@rule[0]",
+		"rule section must still be deleted — it's not in the template at all")
+	assert.Contains(t, mock.Calls, "set firewall.lan.input=ACCEPT")
+}
+
 func TestApply_ReplaceMode_DeletesAnonSectionsInReverseOrder(t *testing.T) {
 	// Simulates the production failure: network has @bridge-vlan[0..2] but
 	// desired config has no bridge-vlan sections. Without reverse-order deletion,

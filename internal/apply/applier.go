@@ -100,25 +100,39 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 	}
 	sort.Strings(sectionTypes)
 
+	parsedSections := make(map[string][]map[string]interface{}, len(sectionTypes))
 	for _, sectionType := range sectionTypes {
-		sectionsJSON := pkgCfg[sectionType]
-		sections, err := parseSections(sectionsJSON)
+		sections, err := parseSections(pkgCfg[sectionType])
 		if err != nil {
 			return fmt.Errorf("parse sections for type %q: %w", sectionType, err)
 		}
+		parsedSections[sectionType] = sections
+	}
 
-		if mode == "replace" {
-			// Build the set of section names that we want to keep.
-			keepNames := make(map[string]bool)
+	if mode == "replace" {
+		// Whole-package replace ("wipe + rewrite", docs/config-format.md): delete every
+		// current section in the package — of ANY section type, not just the types this
+		// payload happens to list — except named sections the payload keeps. Without this,
+		// a section type the template never mentions (e.g. firewall.rule when only
+		// firewall.defaults is templated) would survive untouched even under ".mode":"replace",
+		// since the per-type loop below only ever visits types present in the payload.
+		keepNames := make(map[string]bool)
+		for _, sections := range parsedSections {
 			for _, s := range sections {
 				if name, ok := s[".name"].(string); ok {
 					keepNames[name] = true
 				}
 			}
-			if err := a.deleteUnwantedSections(pkgName, sectionType, keepNames); err != nil {
+		}
+		for _, existingType := range a.existingSectionTypes(pkgName) {
+			if err := a.deleteUnwantedSections(pkgName, existingType, keepNames); err != nil {
 				return err
 			}
 		}
+	}
+
+	for _, sectionType := range sectionTypes {
+		sections := parsedSections[sectionType]
 
 		// In merge mode, pre-fetch existing anonymous section IDs so we can
 		// reuse them instead of always appending a new section via Add().
@@ -191,6 +205,28 @@ func (a *Applier) listUnnamedSections(pkgName, sectionType string) []string {
 		}
 	}
 	return ids
+}
+
+// existingSectionTypes returns the distinct section types currently present in pkgName
+// on the device (e.g. "rule", "zone", "defaults" for the firewall package), regardless
+// of what the desired payload lists. Returns nil if the package doesn't exist yet.
+func (a *Applier) existingSectionTypes(pkgName string) []string {
+	out, err := a.runner.Show(pkgName)
+	if err != nil {
+		return nil
+	}
+	var types []string
+	seen := make(map[string]bool)
+	for _, entry := range parseShowLines(out, pkgName+".") {
+		if strings.Contains(entry.id, ".") {
+			continue // option line, not a section
+		}
+		if !seen[entry.value] {
+			seen[entry.value] = true
+			types = append(types, entry.value)
+		}
+	}
+	return types
 }
 
 // deleteUnwantedSections deletes all current sections of sectionType in pkgName that are
