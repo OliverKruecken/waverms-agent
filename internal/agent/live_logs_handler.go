@@ -11,67 +11,67 @@ import (
 	mqttclient "github.com/OliverKruecken/waverms-agent/internal/mqtt"
 )
 
-// maxDebugPublishes is the maximum number of MQTT debug-log publishes that may
+// maxLiveLogsPublishes is the maximum number of MQTT live-log publishes that may
 // be in flight simultaneously. Excess records are dropped rather than spawning
 // unbounded goroutines, which would grow RSS significantly on slow connections.
-const maxDebugPublishes = 8
+const maxLiveLogsPublishes = 8
 
-// debugState holds the runtime toggle flag, shared across all WithAttrs/WithGroup clones.
-type debugState struct {
+// liveLogsState holds the runtime toggle flag, shared across all WithAttrs/WithGroup clones.
+type liveLogsState struct {
 	mu      sync.RWMutex
 	enabled bool
 }
 
-// mqttDebugHandler is a slog.Handler that:
+// mqttLiveLogsHandler is a slog.Handler that:
 //   - always delegates to the wrapped text handler for local syslog output
-//   - when enabled, additionally publishes every log record to device/{id}/debug/log via MQTT
-type mqttDebugHandler struct {
+//   - when enabled, additionally publishes every log record to device/{id}/live-logs/log via MQTT
+type mqttLiveLogsHandler struct {
 	text     slog.Handler
 	mqtt     mqttclient.MQTTClient
 	deviceID string
-	state    *debugState
-	// sem is a semaphore that caps concurrent MQTT publishes to maxDebugPublishes.
+	state    *liveLogsState
+	// sem is a semaphore that caps concurrent MQTT publishes to maxLiveLogsPublishes.
 	// All clones share the same semaphore so the cap is per-handler-tree, not per-clone.
 	sem chan struct{}
 }
 
-func newMQTTDebugHandler(text slog.Handler, mqtt mqttclient.MQTTClient, deviceID string) *mqttDebugHandler {
-	return &mqttDebugHandler{
+func newMQTTLiveLogsHandler(text slog.Handler, mqtt mqttclient.MQTTClient, deviceID string) *mqttLiveLogsHandler {
+	return &mqttLiveLogsHandler{
 		text:     text,
 		mqtt:     mqtt,
 		deviceID: deviceID,
-		state:    &debugState{},
-		sem:      make(chan struct{}, maxDebugPublishes),
+		state:    &liveLogsState{},
+		sem:      make(chan struct{}, maxLiveLogsPublishes),
 	}
 }
 
 // SetEnabled toggles MQTT log publishing at runtime without restarting the agent.
-func (h *mqttDebugHandler) SetEnabled(enabled bool) {
+func (h *mqttLiveLogsHandler) SetEnabled(enabled bool) {
 	h.state.mu.Lock()
 	h.state.enabled = enabled
 	h.state.mu.Unlock()
 	if enabled {
-		slog.Info("debug mode enabled – log streaming active")
+		slog.Info("live log streaming enabled")
 	} else {
-		slog.Info("debug mode disabled")
+		slog.Info("live log streaming disabled")
 	}
 }
 
-func (h *mqttDebugHandler) mqttEnabled() bool {
+func (h *mqttLiveLogsHandler) mqttEnabled() bool {
 	h.state.mu.RLock()
 	defer h.state.mu.RUnlock()
 	return h.state.enabled
 }
 
-// Enabled returns true if the text handler would log the level, OR if MQTT debug is active
-// (so that Debug records reach Handle even when the local text level is Info).
-func (h *mqttDebugHandler) Enabled(ctx context.Context, level slog.Level) bool {
+// Enabled returns true if the text handler would log the level, OR if MQTT live-log
+// streaming is active (so that Debug records reach Handle even when the local text level is Info).
+func (h *mqttLiveLogsHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.text.Enabled(ctx, level) || h.mqttEnabled()
 }
 
 // Handle writes the record locally (if the text handler accepts the level) and, when MQTT
-// debug is enabled, publishes it to device/{id}/debug/log (QoS 0, no retain, fire-and-forget).
-func (h *mqttDebugHandler) Handle(ctx context.Context, r slog.Record) error {
+// live-log streaming is enabled, publishes it to device/{id}/live-logs/log (QoS 0, no retain, fire-and-forget).
+func (h *mqttLiveLogsHandler) Handle(ctx context.Context, r slog.Record) error {
 	if h.text.Enabled(ctx, r.Level) {
 		_ = h.text.Handle(ctx, r)
 	}
@@ -81,7 +81,7 @@ func (h *mqttDebugHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	payload := h.marshalRecord(r)
-	topic := mqttclient.TopicDebugLog(h.deviceID)
+	topic := mqttclient.TopicLiveLogsLog(h.deviceID)
 
 	select {
 	case h.sem <- struct{}{}:
@@ -92,13 +92,13 @@ func (h *mqttDebugHandler) Handle(ctx context.Context, r slog.Record) error {
 			_ = h.mqtt.Publish(ctx2, topic, payload, 0, false)
 		}()
 	default:
-		// semaphore full – drop this debug record rather than accumulating goroutines
+		// semaphore full – drop this live-log record rather than accumulating goroutines
 	}
 
 	return nil
 }
 
-func (h *mqttDebugHandler) marshalRecord(r slog.Record) []byte {
+func (h *mqttLiveLogsHandler) marshalRecord(r slog.Record) []byte {
 	m := map[string]any{
 		"ts":    r.Time.UTC().Format(time.RFC3339Nano),
 		"level": r.Level.String(),
@@ -148,8 +148,8 @@ func resolveValue(v slog.Value) any {
 
 // WithAttrs returns a clone sharing the same toggle state but with additional attributes
 // pre-applied to the wrapped text handler.
-func (h *mqttDebugHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &mqttDebugHandler{
+func (h *mqttLiveLogsHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &mqttLiveLogsHandler{
 		text:     h.text.WithAttrs(attrs),
 		mqtt:     h.mqtt,
 		deviceID: h.deviceID,
@@ -159,8 +159,8 @@ func (h *mqttDebugHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 }
 
 // WithGroup returns a clone with the given group applied to the wrapped text handler.
-func (h *mqttDebugHandler) WithGroup(name string) slog.Handler {
-	return &mqttDebugHandler{
+func (h *mqttLiveLogsHandler) WithGroup(name string) slog.Handler {
+	return &mqttLiveLogsHandler{
 		text:     h.text.WithGroup(name),
 		mqtt:     h.mqtt,
 		deviceID: h.deviceID,

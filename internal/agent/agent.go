@@ -330,6 +330,7 @@ var supportedCapabilities = []string{
 	"apk_manage",
 	"sysupgrade",
 	"log_control",
+	"logs_fetch",
 }
 
 // fallbackStatePackages is used only when /etc/config cannot be read.
@@ -466,7 +467,7 @@ type Agent struct {
 	bootstrapTokenPath        string
 	bootstrapTokenWaitTimeout time.Duration
 	credsPath                 string
-	debugHandler              *mqttDebugHandler
+	liveLogsHandler           *mqttLiveLogsHandler
 	activityLog               *ActivityLogHandler
 	cmdHandlers               map[string]func(Command)
 	ackRetryDelay             time.Duration
@@ -650,6 +651,7 @@ func New(opts *Options) *Agent {
 		"apk_manage":       a.handleApkManage,
 		"sysupgrade":       a.handleSysupgrade,
 		"log_control":      a.handleLogControl,
+		"logs_fetch":       a.handleLogsFetch,
 	}
 	return a
 }
@@ -795,7 +797,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}
 
-	// Replace the global slog default with the MQTT-aware debug handler now that we
+	// Replace the global slog default with the MQTT-aware live-logs handler now that we
 	// have credentials. If main.go constructed a persistent ActivityLogHandler, reuse
 	// it here so bootstrap-phase and session-phase log lines land in the same file
 	// (and so the file is only ever opened by main.go — see the ActivityLog doc
@@ -811,8 +813,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	} else {
 		innerHandler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: localLevel})
 	}
-	a.debugHandler = newMQTTDebugHandler(innerHandler, a.mqtt, a.creds.DeviceID)
-	slog.SetDefault(slog.New(a.debugHandler))
+	a.liveLogsHandler = newMQTTLiveLogsHandler(innerHandler, a.mqtt, a.creds.DeviceID)
+	slog.SetDefault(slog.New(a.liveLogsHandler))
 	log.SetFlags(0) // TextHandler owns timestamps; avoid double prefix on log.Printf calls
 
 	delay := time.Second
@@ -922,9 +924,9 @@ func (a *Agent) runSession(ctx context.Context) error {
 	}
 	slog.Debug("subscribed", "topic", infoReqTopic)
 
-	controlTopic := mqttclient.TopicDebugControl(a.creds.DeviceID)
-	if err := subscribeOrDisconnect(controlTopic, 1, a.handleDebugControl); err != nil {
-		return fmt.Errorf("subscribe debug/control: %w", err)
+	controlTopic := mqttclient.TopicLiveLogsControl(a.creds.DeviceID)
+	if err := subscribeOrDisconnect(controlTopic, 1, a.handleLiveLogsControl); err != nil {
+		return fmt.Errorf("subscribe live-logs/control: %w", err)
 	}
 	slog.Debug("subscribed", "topic", controlTopic)
 
@@ -1134,18 +1136,18 @@ func (a *Agent) handleStateRequest(topic string, payload []byte) {
 	}
 }
 
-// handleDebugControl toggles MQTT debug log publishing at runtime.
-// The server publishes {"enabled": true|false} to device/{id}/debug/control (retain: true).
-func (a *Agent) handleDebugControl(_ string, payload []byte) {
+// handleLiveLogsControl toggles MQTT live log streaming at runtime.
+// The server publishes {"enabled": true|false} to device/{id}/live-logs/control (retain: true).
+func (a *Agent) handleLiveLogsControl(_ string, payload []byte) {
 	var msg struct {
 		Enabled bool `json:"enabled"`
 	}
 	if err := json.Unmarshal(payload, &msg); err != nil {
-		slog.Error("invalid debug/control payload", "err", err)
+		slog.Error("invalid live-logs/control payload", "err", err)
 		return
 	}
-	if a.debugHandler != nil {
-		a.debugHandler.SetEnabled(msg.Enabled)
+	if a.liveLogsHandler != nil {
+		a.liveLogsHandler.SetEnabled(msg.Enabled)
 	}
 }
 

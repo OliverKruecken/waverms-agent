@@ -678,59 +678,59 @@ func TestRun_SkipsBootstrapWhenCredsPresent(t *testing.T) {
 	assert.Equal(t, "test-device-uuid", mock.ConnectOpts[0].Username)
 }
 
-// ---- handleDebugControl tests -----------------------------------------------
+// ---- handleLiveLogsControl tests -----------------------------------------------
 
-func newTestAgentWithDebugHandler(mock *mqttclient.MockMQTTClient) (*Agent, *mqttDebugHandler) {
+func newTestAgentWithLiveLogsHandler(mock *mqttclient.MockMQTTClient) (*Agent, *mqttLiveLogsHandler) {
 	a := newTestAgent(mock, &uci.MockUCIRunner{})
-	// Wire up a real mqttDebugHandler so SetEnabled / mqttEnabled() are exercised.
+	// Wire up a real mqttLiveLogsHandler so SetEnabled / mqttEnabled() are exercised.
 	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	dh := newMQTTDebugHandler(textHandler, mock, a.creds.DeviceID)
-	a.debugHandler = dh
+	dh := newMQTTLiveLogsHandler(textHandler, mock, a.creds.DeviceID)
+	a.liveLogsHandler = dh
 	return a, dh
 }
 
-func TestHandleDebugControl_EnablesDebug(t *testing.T) {
+func TestHandleLiveLogsControl_EnablesStreaming(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
-	a, dh := newTestAgentWithDebugHandler(mock)
+	a, dh := newTestAgentWithLiveLogsHandler(mock)
 
-	a.handleDebugControl("device/test-device-uuid/debug/control", []byte(`{"enabled":true}`))
+	a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`{"enabled":true}`))
 
 	assert.True(t, dh.mqttEnabled(), "mqttEnabled must be true after enabled:true payload")
 }
 
-func TestHandleDebugControl_DisablesDebug(t *testing.T) {
+func TestHandleLiveLogsControl_DisablesStreaming(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
-	a, dh := newTestAgentWithDebugHandler(mock)
+	a, dh := newTestAgentWithLiveLogsHandler(mock)
 
 	// First enable, then disable.
-	a.handleDebugControl("device/test-device-uuid/debug/control", []byte(`{"enabled":true}`))
+	a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`{"enabled":true}`))
 	require.True(t, dh.mqttEnabled())
 
-	a.handleDebugControl("device/test-device-uuid/debug/control", []byte(`{"enabled":false}`))
+	a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`{"enabled":false}`))
 	assert.False(t, dh.mqttEnabled(), "mqttEnabled must be false after enabled:false payload")
 }
 
-func TestHandleDebugControl_InvalidJSON_NoPanic(t *testing.T) {
+func TestHandleLiveLogsControl_InvalidJSON_NoPanic(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
-	a, dh := newTestAgentWithDebugHandler(mock)
+	a, dh := newTestAgentWithLiveLogsHandler(mock)
 
 	// Must not panic; must leave state unchanged (false).
 	assert.NotPanics(t, func() {
-		a.handleDebugControl("device/test-device-uuid/debug/control", []byte(`not-json`))
+		a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`not-json`))
 	})
 	assert.False(t, dh.mqttEnabled(), "state must remain false after invalid payload")
 }
 
-func TestHandleDebugControl_NilDebugHandler_NoPanic(t *testing.T) {
+func TestHandleLiveLogsControl_NilLiveLogsHandler_NoPanic(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	a := newTestAgent(mock, &uci.MockUCIRunner{})
-	// a.debugHandler is nil — must not panic.
+	// a.liveLogsHandler is nil — must not panic.
 	assert.NotPanics(t, func() {
-		a.handleDebugControl("device/test-device-uuid/debug/control", []byte(`{"enabled":true}`))
+		a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`{"enabled":true}`))
 	})
 }
 
-func TestRunSession_SubscribesDebugControl(t *testing.T) {
+func TestRunSession_SubscribesLiveLogsControl(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	a := newTestAgent(mock, &uci.MockUCIRunner{})
 
@@ -744,8 +744,8 @@ func TestRunSession_SubscribesDebugControl(t *testing.T) {
 	cancel()
 	<-done
 
-	assert.True(t, mock.HasSubscription("device/test-device-uuid/debug/control"),
-		"runSession must subscribe to device/{id}/debug/control")
+	assert.True(t, mock.HasSubscription("device/test-device-uuid/live-logs/control"),
+		"runSession must subscribe to device/{id}/live-logs/control")
 }
 
 func TestReadHostname_ReturnsUnknownOnMissingFile(t *testing.T) {

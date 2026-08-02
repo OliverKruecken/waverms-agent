@@ -49,12 +49,12 @@ func TopicState(deviceID string) string {
 	return fmt.Sprintf("device/%s/state", deviceID)
 }
 
-// TopicDebugControl returns the topic the server publishes debug mode toggles to (retain: true).
-func TopicDebugControl(deviceID string) string {
-	return fmt.Sprintf("device/%s/debug/control", deviceID)
+// TopicLiveLogsControl returns the topic the server publishes live-log streaming toggles to (retain: true).
+func TopicLiveLogsControl(deviceID string) string {
+	return fmt.Sprintf("device/%s/live-logs/control", deviceID)
 }
 
-// TopicDebugLog returns the topic the agent publishes debug log entries to (QoS 0, no retain).
-func TopicDebugLog(deviceID string) string {
-	return fmt.Sprintf("device/%s/debug/log", deviceID)
+// TopicLiveLogsLog returns the topic the agent publishes live log entries to (QoS 0, no retain).
+func TopicLiveLogsLog(deviceID string) string {
+	return fmt.Sprintf("device/%s/live-logs/log", deviceID)
 }
