@@ -78,16 +78,18 @@ func TestServiceReloads_NoDuplicates(t *testing.T) {
 	assert.Len(t, cmds, 1)
 }
 
+// ubusUsteerFixture mirrors a real `ubus call service list '{"verbose":true}'`
+// capture (see reload_discovery_test.go for the full annotated version):
+// "triggers" sits directly on the service, and a "config.change" rule wraps its
+// package check in ["if", ["eq","package",pkg], ["run_script", ...argv]].
 const ubusUsteerFixture = `{
   "usteer": {
     "instances": {
-      "instance1": {
-        "running": true,
-        "triggers": [
-          ["config.change", "usteer", ["run_command", ["/etc/init.d/usteer", "reload"]]]
-        ]
-      }
-    }
+      "instance1": { "running": true }
+    },
+    "triggers": [
+      ["config.change", ["if", ["eq", "package", "usteer"], ["run_script", "/etc/init.d/usteer", "reload"]], 1000]
+    ]
   }
 }`
 
@@ -179,9 +181,9 @@ func TestRunReloads_NoTierMatches_ReturnsNoError(t *testing.T) {
 func TestServiceReloads_Precedence_StaticOverridesUbus(t *testing.T) {
 	orig := apply.Discoverer
 	apply.Discoverer = &apply.FakeReloadDiscoverer{
-		UbusOutput: []byte(`{"network":{"instances":{"i1":{"triggers":[
-			["config.change","network",["run_command",["/etc/init.d/network","restart"]]]
-		]}}}}`),
+		UbusOutput: []byte(`{"network":{"triggers":[
+			["config.change",["if",["eq","package","network"],["run_script","/etc/init.d/network","restart"]],1000]
+		]}}`),
 	}
 	t.Cleanup(func() { apply.Discoverer = orig })
 

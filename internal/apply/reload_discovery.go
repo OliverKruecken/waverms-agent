@@ -104,16 +104,19 @@ func parseUCITrack(raw []byte) map[string]ucitrackEntry {
 }
 
 // parseUbusTriggers extracts pkg -> reload command from `ubus call service list
-// '{"verbose":true}'` output, by walking each running instance's registered procd
-// reload triggers (procd_add_reload_trigger in the package's own init script).
+// '{"verbose":true}'` output, by walking each service's registered procd
+// "config.change" reload triggers (procd_add_reload_trigger in the package's own
+// init script). "triggers" is a top-level field of the service object itself, not
+// nested under "instances" — a service with no running instance (or no instances
+// key at all, e.g. "cron") can still declare triggers.
 //
-// Procd's trigger-rule nesting isn't parsed into a fixed struct because its exact
-// shape has varied across OpenWrt releases; this walks generically
-// ([]interface{}/map[string]interface{}) and skips anything unrecognized instead
-// of erroring. The assumed rule shape is
-// ["config.change", "<pkg>", ["run_command", ["/etc/init.d/<pkg>", "reload"]]] —
-// verify against a real device capture (see reload_discovery_test.go) before
-// relying on this for a new OpenWrt release.
+// Rule shape, confirmed against a live device capture (23.05-era procd):
+//
+//	["config.change", ["if", ["eq","package","usteer"], ["run_script","/etc/init.d/usteer","reload"]], 1000]
+//
+// Anything not matching this shape (other event types like "interface.*", more
+// complex conditions than a single "eq package" check) is skipped, not erroring —
+// procd's exact expression grammar isn't parsed in full, just this one pattern.
 func parseUbusTriggers(raw []byte) map[string]string {
 	result := make(map[string]string)
 	var services map[string]interface{}
@@ -125,65 +128,78 @@ func parseUbusTriggers(raw []byte) map[string]string {
 		if !ok {
 			continue
 		}
-		instances, ok := svcMap["instances"].(map[string]interface{})
+		triggers, ok := svcMap["triggers"].([]interface{})
 		if !ok {
 			continue
 		}
-		for _, inst := range instances {
-			instMap, ok := inst.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			triggers, ok := instMap["triggers"].([]interface{})
-			if !ok {
-				continue
-			}
-			for _, t := range triggers {
-				if pkg, cmd, ok := parseTriggerRule(t); ok {
-					result[pkg] = cmd
-				}
+		for _, t := range triggers {
+			if pkg, cmd, ok := parseTriggerRule(t); ok {
+				result[pkg] = cmd
 			}
 		}
 	}
 	return result
 }
 
-// parseTriggerRule extracts (package name, reload command) from one procd trigger
-// rule, e.g. ["config.change", "usteer", ["run_command", ["/etc/init.d/usteer", "reload"]]].
+// parseTriggerRule extracts (package name, reload command) from one procd
+// "config.change" trigger rule of the form
+// ["config.change", ["if", ["eq","package","<pkg>"], ["run_script", ...argv]], <priority>].
 func parseTriggerRule(rule interface{}) (pkg string, cmd string, ok bool) {
 	arr, isArr := rule.([]interface{})
-	if !isArr || len(arr) < 3 {
+	if !isArr || len(arr) < 2 {
 		return "", "", false
 	}
-	event, _ := arr[0].(string)
-	if event != "config.change" {
+	if event, _ := arr[0].(string); event != "config.change" {
 		return "", "", false
 	}
-	pkg, isStr := arr[1].(string)
-	if !isStr {
+	expr, isArr := arr[1].([]interface{})
+	if !isArr || len(expr) != 3 {
 		return "", "", false
 	}
-	argv := findRunCommand(arr[2:])
-	if len(argv) == 0 {
+	if verb, _ := expr[0].(string); verb != "if" {
 		return "", "", false
 	}
-	return pkg, strings.Join(argv, " "), true
+	pkg, ok = matchPackageCondition(expr[1])
+	if !ok {
+		return "", "", false
+	}
+	action, isArr := expr[2].([]interface{})
+	if !isArr {
+		return "", "", false
+	}
+	argv := flattenStrings(action)
+	if len(argv) < 2 {
+		return "", "", false
+	}
+	if argv[0] != "run_script" && argv[0] != "run_command" {
+		return "", "", false
+	}
+	// Some services (notably the built-in "ucitrack" shim) register indirection
+	// rules that just re-publish `ubus call service event` for a DIFFERENT
+	// package rather than actually reloading anything for this one — e.g.
+	// firewall changing gets echoed as a synthetic "luci-splash" package change
+	// for whatever else might be listening. That's not a usable reload command.
+	if argv[1] == "ubus" {
+		return "", "", false
+	}
+	return pkg, strings.Join(argv[1:], " "), true
 }
 
-// findRunCommand searches (possibly nested) trigger action elements for a
-// "run_command" action and returns its argv, flattening any nested arrays.
-func findRunCommand(elems []interface{}) []string {
-	for i, e := range elems {
-		if s, ok := e.(string); ok && s == "run_command" {
-			return flattenStrings(elems[i+1:])
-		}
-		if nested, ok := e.([]interface{}); ok {
-			if argv := findRunCommand(nested); len(argv) > 0 {
-				return argv
-			}
-		}
+// matchPackageCondition extracts the package name from an ["eq", "package", "<pkg>"]
+// condition. Any other condition shape (e.g. multiple ANDed checks) isn't
+// resolvable to a single package name and is skipped.
+func matchPackageCondition(cond interface{}) (string, bool) {
+	arr, isArr := cond.([]interface{})
+	if !isArr || len(arr) != 3 {
+		return "", false
 	}
-	return nil
+	op, _ := arr[0].(string)
+	field, _ := arr[1].(string)
+	pkg, isStr := arr[2].(string)
+	if op != "eq" || field != "package" || !isStr {
+		return "", false
+	}
+	return pkg, true
 }
 
 func flattenStrings(elems []interface{}) []string {

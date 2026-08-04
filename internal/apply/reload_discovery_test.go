@@ -6,66 +6,88 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// ubusUsteerFixture is a trimmed excerpt of a real `ubus call service list
+// '{"verbose":true}'` capture from an OpenWrt 23.05 device running usteer —
+// confirmed live (2026-08-04) rather than hand-written from memory of procd's
+// trigger-rule schema. "triggers" sits directly on the service object, not
+// nested under "instances"; the "config.change" rule wraps its package check
+// in an ["if", ["eq","package",pkg], action] expression, and the action verb is
+// "run_script" with flat argv, not "run_command" with nested argv.
+const ubusUsteerFixture = `{
+	"usteer": {
+		"instances": {
+			"instance1": { "running": true, "pid": 2132, "command": ["/sbin/usteerd"] }
+		},
+		"triggers": [
+			["config.change", ["if", ["eq", "package", "usteer"], ["run_script", "/etc/init.d/usteer", "reload"]], 1000],
+			["interface.*", [["run_script", "/etc/init.d/usteer", "reload"]], 2000]
+		]
+	}
+}`
+
 func TestParseUbusTriggers_ValidTrigger(t *testing.T) {
-	raw := []byte(`{
-		"usteer": {
-			"instances": {
-				"instance1": {
-					"running": true,
-					"triggers": [
-						["config.change", "usteer", ["run_command", ["/etc/init.d/usteer", "reload"]]]
-					]
-				}
-			}
-		}
-	}`)
-	result := parseUbusTriggers(raw)
+	result := parseUbusTriggers([]byte(ubusUsteerFixture))
 	assert.Equal(t, "/etc/init.d/usteer reload", result["usteer"])
 }
 
-func TestParseUbusTriggers_FlatRunCommandArgs(t *testing.T) {
-	// Some procd builds emit run_command args flat rather than nested in a
-	// sub-array; the parser must handle both shapes.
+func TestParseUbusTriggers_NonConfigChangeEventSkipped(t *testing.T) {
+	// usteer's second trigger fires on "interface.*", not "config.change" — it
+	// has no package name to key on and must not produce a map entry.
+	result := parseUbusTriggers([]byte(ubusUsteerFixture))
+	assert.Len(t, result, 1, "only the config.change trigger should be captured")
+}
+
+func TestParseUbusTriggers_ForwardingEchoSkipped(t *testing.T) {
+	// Real capture: the built-in "ucitrack" service re-publishes a firewall
+	// change as a synthetic "luci-splash" package-change event via
+	// `ubus call service event ...` rather than reloading anything itself.
+	// That's not a usable reload command and must be skipped.
 	raw := []byte(`{
-		"usteer": {
-			"instances": {
-				"instance1": {
-					"triggers": [
-						["config.change", "usteer", ["run_command", "/etc/init.d/usteer", "reload"]]
-					]
-				}
-			}
+		"ucitrack": {
+			"triggers": [
+				["config.change", ["if", ["eq", "package", "firewall"],
+					["run_script", "ubus", "call", "service", "event",
+						"{\"type\":\"config.change\",\"data\":{\"package\":\"luci-splash\"}}"]
+				], 1000]
+			]
 		}
 	}`)
 	result := parseUbusTriggers(raw)
-	assert.Equal(t, "/etc/init.d/usteer reload", result["usteer"])
+	assert.Empty(t, result, "a ubus-forwarding echo must not be treated as a reload command")
+}
+
+func TestParseUbusTriggers_ServiceWithNoInstancesKey(t *testing.T) {
+	// Real capture: "cron" has triggers but no "instances" key at all (not just
+	// an empty one) — triggers must not require an instances key to be present.
+	raw := []byte(`{
+		"cron": {
+			"triggers": [
+				["config.change", ["if", ["eq", "package", "cron"], ["run_script", "/etc/init.d/cron", "reload"]], 1000]
+			]
+		}
+	}`)
+	result := parseUbusTriggers(raw)
+	assert.Equal(t, "/etc/init.d/cron reload", result["cron"])
 }
 
 func TestParseUbusTriggers_MissingTriggersKey(t *testing.T) {
-	raw := []byte(`{"usteer": {"instances": {"instance1": {"running": true}}}}`)
-	result := parseUbusTriggers(raw)
-	assert.Empty(t, result)
-}
-
-func TestParseUbusTriggers_MissingInstancesKey(t *testing.T) {
-	raw := []byte(`{"usteer": {"running": true}}`)
+	// Real capture: "ubus" service has no "triggers" field at all.
+	raw := []byte(`{"ubus": {"instances": {"instance1": {"running": true}}}}`)
 	result := parseUbusTriggers(raw)
 	assert.Empty(t, result)
 }
 
 func TestParseUbusTriggers_MalformedTriggerRule(t *testing.T) {
 	raw := []byte(`{
-		"usteer": {
-			"instances": {
-				"instance1": {
-					"triggers": [
-						["config.change"],
-						"not-an-array",
-						["config.change", 123, ["run_command", ["reload"]]],
-						["config.change", "usteer", ["not_run_command"]]
-					]
-				}
-			}
+		"pkg": {
+			"triggers": [
+				["config.change"],
+				"not-an-array",
+				["config.change", "not-an-array-condition", 1000],
+				["config.change", ["if", ["eq", "package", 123], ["run_script", "reload"]], 1000],
+				["config.change", ["if", ["and", ["eq","package","a"],["eq","package","b"]], ["run_script","/etc/init.d/a","reload"]], 1000],
+				["config.change", ["if", ["eq", "package", "pkg"], ["not_run_script"]], 1000]
+			]
 		}
 	}`)
 	assert.NotPanics(t, func() {
