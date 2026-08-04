@@ -4,7 +4,6 @@ package apply
 import (
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strings"
 
@@ -356,73 +355,4 @@ func parseSections(raw json.RawMessage) ([]map[string]interface{}, error) {
 		return nil, err
 	}
 	return []map[string]interface{}{single}, nil
-}
-
-// serviceEntry holds the reload command and the init.d service name used to
-// check whether the service is enabled before reloading.
-type serviceEntry struct {
-	reloadCmd   string
-	initService string // name passed to /etc/init.d/<name> enabled
-}
-
-// serviceMap maps UCI package names to their reload command and init.d service.
-// For the "wireless" package, netifd (managed by the "network" init.d service)
-// controls the wifi stack, so its enabled state is checked via "network".
-var serviceMap = map[string]serviceEntry{
-	"wireless": {reloadCmd: "wifi reload",                 initService: "network"},
-	"network":  {reloadCmd: "/etc/init.d/network reload",  initService: "network"},
-	"system":   {reloadCmd: "/etc/init.d/system reload",   initService: "system"},
-	"firewall": {reloadCmd: "/etc/init.d/firewall reload", initService: "firewall"},
-	"dhcp":     {reloadCmd: "/etc/init.d/dnsmasq reload",  initService: "dnsmasq"},
-}
-
-// CheckServiceEnabled reports whether the named init.d service is enabled.
-// It is a package-level variable so tests can replace it without hitting the OS.
-var CheckServiceEnabled = func(name string) bool {
-	return exec.Command("/etc/init.d/"+name, "enabled").Run() == nil //nolint:gosec
-}
-
-// ServiceReloads returns the ordered list of reload commands for the given package names.
-// Duplicates are suppressed. It does NOT check whether services are enabled; use
-// RunReloads for production use where disabled services must be skipped.
-func ServiceReloads(pkgNames []string) []string {
-	seen := make(map[string]bool)
-	var cmds []string
-	for _, pkg := range pkgNames {
-		if entry, ok := serviceMap[pkg]; ok && !seen[entry.reloadCmd] {
-			cmds = append(cmds, entry.reloadCmd)
-			seen[entry.reloadCmd] = true
-		}
-	}
-	return cmds
-}
-
-// RunReloads executes the service reload commands for the given packages.
-// A reload is skipped when the associated init.d service is disabled
-// (/etc/init.d/<service> enabled returns non-zero).
-// Returns a slice of error strings for any reload that failed; other reloads continue.
-func RunReloads(pkgNames []string) []string {
-	seenCmd := make(map[string]bool)
-	var errs []string
-	for _, pkg := range pkgNames {
-		entry, ok := serviceMap[pkg]
-		if !ok || seenCmd[entry.reloadCmd] {
-			continue
-		}
-		seenCmd[entry.reloadCmd] = true
-
-		if !CheckServiceEnabled(entry.initService) {
-			continue // service is disabled; skip reload
-		}
-
-		parts := strings.Fields(entry.reloadCmd)
-		if len(parts) == 0 {
-			continue
-		}
-		out, err := exec.Command(parts[0], parts[1:]...).CombinedOutput() //nolint:gosec
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v: %s", entry.reloadCmd, err, strings.TrimSpace(string(out))))
-		}
-	}
-	return errs
 }
