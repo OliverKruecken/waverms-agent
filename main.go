@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"flag"
 	"log"
 	"log/slog"
 	"os"
@@ -42,6 +43,15 @@ func main() {
 		debug.SetMemoryLimit(32 << 20) // 32 MiB
 	}
 
+	// -debug is a run-time-only override for one-off diagnostic runs (e.g.
+	// stopping the procd-managed instance and running the binary by hand over
+	// SSH) without editing the persistent DEBUG=true key in /etc/waverms/config.
+	// It's equivalent to that config key, not additive to it — see cfg.Debug
+	// below, which both the initial handler and agent.go's later live-logs
+	// handler key off of.
+	debugFlag := flag.Bool("debug", false, "enable debug-level logging for this run")
+	flag.Parse()
+
 	// WaitForBrokerHost polls /etc/waverms/config and the DHCP overlay
 	// /etc/waverms/dhcp (written by /etc/udhcpc.user.d/60-waverms-bootstrap
 	// from option 225) until BROKER_HOST is non-empty or 120 s elapse.
@@ -50,6 +60,9 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	cfg.AgentVersion = Version
+	if *debugFlag {
+		cfg.Debug = true
+	}
 
 	logLevel := slog.LevelInfo
 	if cfg.Debug {

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // serviceEntry holds the reload command and the init.d service name used to
@@ -51,13 +52,31 @@ type reloadDiscovery struct {
 
 func newReloadDiscovery(d ReloadDiscoverer) reloadDiscovery {
 	var rd reloadDiscovery
-	if out, err := d.UbusServiceList(); err == nil {
+	if out, err := d.UbusServiceList(); err != nil {
+		slog.Debug("reload discovery: ubus service list unavailable", "err", err)
+	} else {
 		rd.ubusTriggers = parseUbusTriggers(out)
+		slog.Debug("reload discovery: ubus service list parsed", "packages", mapKeys(rd.ubusTriggers))
 	}
-	if out, err := d.ReadUCITrack(); err == nil {
+	if out, err := d.ReadUCITrack(); err != nil {
+		slog.Debug("reload discovery: ucitrack.json unavailable", "err", err)
+	} else {
 		rd.trackEntries = parseUCITrack(out)
+		slog.Debug("reload discovery: ucitrack.json parsed", "packages", mapKeys(rd.trackEntries))
 	}
 	return rd
+}
+
+// mapKeys is a small debug-logging helper — slog can't usefully print a raw
+// map[string]T group value, so trigger/track tables are logged as a sorted key
+// list instead (the discovered commands themselves show up per-package in the
+// resolve() debug line below).
+func mapKeys[T any](m map[string]T) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // resolve finds the reload command for pkg by walking the precedence chain:
@@ -101,7 +120,8 @@ func ServiceReloads(pkgNames []string) []string {
 	seen := make(map[string]bool)
 	var cmds []string
 	for _, pkg := range pkgNames {
-		cmd, _, _, _, ok := rd.resolve(pkg, Discoverer)
+		cmd, _, _, tier, ok := rd.resolve(pkg, Discoverer)
+		slog.Debug("reload discovery: resolved package", "package", pkg, "tier", tier, "command", cmd, "found", ok)
 		if ok && !seen[cmd] {
 			cmds = append(cmds, cmd)
 			seen[cmd] = true
@@ -120,24 +140,31 @@ func RunReloads(pkgNames []string) []string {
 	var errs []string
 	for _, pkg := range pkgNames {
 		cmd, checkEnabled, initService, tier, ok := rd.resolve(pkg, Discoverer)
+		slog.Debug("reload discovery: resolved package", "package", pkg, "tier", tier, "command", cmd, "found", ok, "gated", checkEnabled)
 		if !ok {
 			slog.Warn("config_apply: no reload path found for package", "package", pkg)
 			continue
 		}
 		if seenCmd[cmd] {
+			slog.Debug("config_apply: reload command already run this cycle, skipping", "package", pkg, "command", cmd)
 			continue
 		}
 		seenCmd[cmd] = true
 
 		if checkEnabled && !CheckServiceEnabled(initService) {
-			continue // service is disabled; skip reload
+			slog.Debug("config_apply: service disabled, skipping reload", "package", pkg, "command", cmd, "init_service", initService)
+			continue
 		}
 
 		parts := strings.Fields(cmd)
 		if len(parts) == 0 {
 			continue
 		}
+		start := time.Now()
 		out, err := exec.Command(parts[0], parts[1:]...).CombinedOutput() //nolint:gosec
+		slog.Debug("config_apply: reload command finished",
+			"package", pkg, "tier", tier, "command", cmd,
+			"duration", time.Since(start), "err", err, "output", strings.TrimSpace(string(out)))
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s (%s): %v: %s", cmd, tier, err, strings.TrimSpace(string(out))))
 		}
