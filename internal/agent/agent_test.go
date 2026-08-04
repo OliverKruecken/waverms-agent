@@ -730,6 +730,54 @@ func TestHandleLiveLogsControl_NilLiveLogsHandler_NoPanic(t *testing.T) {
 	})
 }
 
+// ---- handleLogLevelControl tests -----------------------------------------------
+
+func newTestAgentWithLogLevel(mock *mqttclient.MockMQTTClient) (*Agent, *slog.LevelVar) {
+	a := newTestAgent(mock, &uci.MockUCIRunner{})
+	lv := new(slog.LevelVar)
+	lv.Set(slog.LevelInfo)
+	a.logLevel = lv
+	return a, lv
+}
+
+func TestHandleLogLevelControl_RaisesToDebug(t *testing.T) {
+	mock := mqttclient.NewMockMQTTClient()
+	a, lv := newTestAgentWithLogLevel(mock)
+
+	a.handleLogLevelControl("device/test-device-uuid/log-level/control", []byte(`{"enabled":true}`))
+
+	assert.Equal(t, slog.LevelDebug, lv.Level(), "level must be Debug after enabled:true payload")
+}
+
+func TestHandleLogLevelControl_LowersToInfo(t *testing.T) {
+	mock := mqttclient.NewMockMQTTClient()
+	a, lv := newTestAgentWithLogLevel(mock)
+	lv.Set(slog.LevelDebug)
+
+	a.handleLogLevelControl("device/test-device-uuid/log-level/control", []byte(`{"enabled":false}`))
+
+	assert.Equal(t, slog.LevelInfo, lv.Level(), "level must be Info after enabled:false payload")
+}
+
+func TestHandleLogLevelControl_InvalidJSON_NoPanic(t *testing.T) {
+	mock := mqttclient.NewMockMQTTClient()
+	a, lv := newTestAgentWithLogLevel(mock)
+
+	assert.NotPanics(t, func() {
+		a.handleLogLevelControl("device/test-device-uuid/log-level/control", []byte(`not-json`))
+	})
+	assert.Equal(t, slog.LevelInfo, lv.Level(), "level must remain unchanged after invalid payload")
+}
+
+func TestHandleLogLevelControl_NilLogLevel_NoPanic(t *testing.T) {
+	mock := mqttclient.NewMockMQTTClient()
+	a := newTestAgent(mock, &uci.MockUCIRunner{})
+	// a.logLevel is nil — must not panic.
+	assert.NotPanics(t, func() {
+		a.handleLogLevelControl("device/test-device-uuid/log-level/control", []byte(`{"enabled":true}`))
+	})
+}
+
 func TestRunSession_SubscribesLiveLogsControl(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	a := newTestAgent(mock, &uci.MockUCIRunner{})
@@ -746,6 +794,24 @@ func TestRunSession_SubscribesLiveLogsControl(t *testing.T) {
 
 	assert.True(t, mock.HasSubscription("device/test-device-uuid/live-logs/control"),
 		"runSession must subscribe to device/{id}/live-logs/control")
+}
+
+func TestRunSession_SubscribesLogLevelControl(t *testing.T) {
+	mock := mqttclient.NewMockMQTTClient()
+	a := newTestAgent(mock, &uci.MockUCIRunner{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.runSession(ctx) //nolint:errcheck
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-done
+
+	assert.True(t, mock.HasSubscription("device/test-device-uuid/log-level/control"),
+		"runSession must subscribe to device/{id}/log-level/control")
 }
 
 func TestReadHostname_ReturnsUnknownOnMissingFile(t *testing.T) {
@@ -2094,4 +2160,16 @@ func TestPublishInfo_CapabilitiesContainLogControl(t *testing.T) {
 	var info InfoPayload
 	require.NoError(t, json.Unmarshal(mock.Published[0].Payload, &info))
 	assert.Contains(t, info.Capabilities, "log_control")
+}
+
+func TestPublishInfo_CapabilitiesContainLogLevelControl(t *testing.T) {
+	mock := mqttclient.NewMockMQTTClient()
+	a := newTestAgent(mock, &uci.MockUCIRunner{})
+
+	err := a.publishInfo(context.Background())
+	require.NoError(t, err)
+
+	var info InfoPayload
+	require.NoError(t, json.Unmarshal(mock.Published[0].Payload, &info))
+	assert.Contains(t, info.Capabilities, "log_level_control")
 }

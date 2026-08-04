@@ -331,6 +331,7 @@ var supportedCapabilities = []string{
 	"sysupgrade",
 	"log_control",
 	"logs_fetch",
+	"log_level_control",
 }
 
 // fallbackStatePackages is used only when /etc/config cannot be read.
@@ -441,6 +442,11 @@ type Options struct {
 	// here so bootstrap-phase and session-phase log lines land in the same
 	// file. Nil if the file could not be opened at startup, or in tests.
 	ActivityLog *ActivityLogHandler
+	// LogLevel is the shared slog.LevelVar backing every handler in main.go's
+	// chain. handleLogLevelControl mutates it at runtime in response to the
+	// log-level/control MQTT topic. Nil in tests that don't care about dynamic
+	// level control — handleLogLevelControl no-ops in that case.
+	LogLevel *slog.LevelVar
 }
 
 // Agent is the main runtime component.
@@ -469,6 +475,7 @@ type Agent struct {
 	credsPath                 string
 	liveLogsHandler           *mqttLiveLogsHandler
 	activityLog               *ActivityLogHandler
+	logLevel                  *slog.LevelVar
 	cmdHandlers               map[string]func(Command)
 	ackRetryDelay             time.Duration
 
@@ -625,6 +632,7 @@ func New(opts *Options) *Agent {
 		bootstrapTokenWaitTimeout: tokenWait,
 		credsPath:                 credsPath,
 		activityLog:               opts.ActivityLog,
+		logLevel:                  opts.LogLevel,
 		cleanStartSentinelPath:    sentinelPath,
 		ackRetryDelay:             ackRetryDelay,
 	}
@@ -803,8 +811,15 @@ func (a *Agent) Run(ctx context.Context) error {
 	// (and so the file is only ever opened by main.go — see the ActivityLog doc
 	// comment on Options, and the nil branch below, which must stay pure in-memory
 	// so tests that build an Agent directly via New() never touch the real filesystem).
-	localLevel := slog.LevelInfo
-	if a.cfg.Debug {
+	//
+	// This branch is only actually reached in tests: in production a.activityLog is
+	// always non-nil (set by main.go), so innerHandler below reuses its handler chain
+	// — which already shares a.logLevel via main.go's HandlerOptions — without needing
+	// a fresh HandlerOptions here at all.
+	var localLevel slog.Leveler = slog.LevelInfo
+	if a.logLevel != nil {
+		localLevel = a.logLevel
+	} else if a.cfg.Debug {
 		localLevel = slog.LevelDebug
 	}
 	var innerHandler slog.Handler
@@ -929,6 +944,12 @@ func (a *Agent) runSession(ctx context.Context) error {
 		return fmt.Errorf("subscribe live-logs/control: %w", err)
 	}
 	slog.Debug("subscribed", "topic", controlTopic)
+
+	logLevelTopic := mqttclient.TopicLogLevelControl(a.creds.DeviceID)
+	if err := subscribeOrDisconnect(logLevelTopic, 1, a.handleLogLevelControl); err != nil {
+		return fmt.Errorf("subscribe log-level/control: %w", err)
+	}
+	slog.Debug("subscribed", "topic", logLevelTopic)
 
 	// Clear the retained "offline" LWT so a restarting server does not receive a
 	// stale offline status for a device that is actually online.
@@ -1149,6 +1170,33 @@ func (a *Agent) handleLiveLogsControl(_ string, payload []byte) {
 	if a.liveLogsHandler != nil {
 		a.liveLogsHandler.SetEnabled(msg.Enabled)
 	}
+}
+
+// handleLogLevelControl processes an incoming log-level/control message by
+// raising or lowering the agent's baseline slog level at runtime — no restart
+// needed. Unlike handleLiveLogsControl (which only affects what's streamed
+// live), this changes what's written to the persistent activity log file too,
+// since a.logLevel is the same LevelVar every handler in main.go's chain reads
+// from. The retained MQTT topic re-delivers the last value on every
+// (re)subscribe, so the setting survives an agent restart without the agent
+// ever needing to persist it to disk itself.
+func (a *Agent) handleLogLevelControl(_ string, payload []byte) {
+	var msg struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		slog.Error("invalid log-level/control payload", "err", err)
+		return
+	}
+	if a.logLevel == nil {
+		return
+	}
+	if msg.Enabled {
+		a.logLevel.Set(slog.LevelDebug)
+	} else {
+		a.logLevel.Set(slog.LevelInfo)
+	}
+	slog.Info("log level updated via log-level/control", "debug_enabled", msg.Enabled)
 }
 
 // publishState collects UCI state for the given packages and publishes it

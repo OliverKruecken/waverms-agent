@@ -58,3 +58,8 @@ func TopicLiveLogsControl(deviceID string) string {
 func TopicLiveLogsLog(deviceID string) string {
 	return fmt.Sprintf("device/%s/live-logs/log", deviceID)
 }
+
+// TopicLogLevelControl returns the topic the server publishes debug-level toggles to (retain: true).
+func TopicLogLevelControl(deviceID string) string {
+	return fmt.Sprintf("device/%s/log-level/control", deviceID)
+}

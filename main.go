@@ -64,9 +64,15 @@ func main() {
 		cfg.Debug = true
 	}
 
-	logLevel := slog.LevelInfo
+	// logLevel is a LevelVar rather than a static Level so the log-level/control
+	// MQTT topic (agent.go's handleLogLevelControl) can raise/lower verbosity at
+	// runtime without a restart — every handler in the chain built below shares
+	// this same instance.
+	logLevel := new(slog.LevelVar)
 	if cfg.Debug {
-		logLevel = slog.LevelDebug
+		logLevel.Set(slog.LevelDebug)
+	} else {
+		logLevel.Set(slog.LevelInfo)
 	}
 	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
 
@@ -119,6 +125,7 @@ func main() {
 		UCI:            &uci.RealUCIRunner{},
 		Version:        Version,
 		ActivityLog:    activityLog,
+		LogLevel:       logLevel,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

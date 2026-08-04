@@ -29,3 +29,7 @@ func TestTopicBootstrapRegister(t *testing.T) {
 func TestTopicBootstrapResponse(t *testing.T) {
 	assert.Equal(t, "bootstrap/tmp-uuid-001/response", TopicBootstrapResponse("tmp-uuid-001"))
 }
+
+func TestTopicLogLevelControl(t *testing.T) {
+	assert.Equal(t, "device/abc-123/log-level/control", TopicLogLevelControl("abc-123"))
+}
