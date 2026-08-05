@@ -206,8 +206,14 @@ func (a *Agent) handleSysupgrade(cmd Command) {
 	// so PUBACK for this QoS-1 command is never sent. The broker re-delivers it
 	// on the next connect; the sentinel makes the agent request CleanStart=true
 	// for that connect, discarding the queued message.
-	// Only needed for keep_config=true — factory reset wipes /etc/config/ and
-	// also wipes the credentials, so the agent can't reconnect anyway.
+	// Only useful for keep_config=true: the sentinel lives under /etc/config/,
+	// which a keep_config=false (factory reset) sysupgrade wipes right along
+	// with everything else, so writing it here would be pointless for that case.
+	// That path is NOT "the agent can't reconnect anyway" though — it re-bootstraps
+	// and gets the same device.id (and therefore MQTT ClientID) back from the
+	// backend's MAC-based lookup, so it very much can resume this same queued
+	// command. See Run()'s needsCleanStart.Store(true) after a successful
+	// bootstrap, which covers this case unconditionally instead.
 	if p.KeepConfig {
 		if err := os.WriteFile(a.cleanStartSentinelPath, []byte("1"), 0600); err != nil {
 			slog.Warn("sysupgrade: could not write clean-start sentinel", "path", a.cleanStartSentinelPath, "err", err)

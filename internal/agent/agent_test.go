@@ -678,6 +678,73 @@ func TestRun_SkipsBootstrapWhenCredsPresent(t *testing.T) {
 	assert.Equal(t, "test-device-uuid", mock.ConnectOpts[0].Username)
 }
 
+// TestRun_BootstrapForcesCleanStartOnNextConnect covers the sysupgrade-reboot-loop
+// bug: a device that re-bootstraps (e.g. after a keep_config=false sysupgrade wiped
+// its credentials) gets the same device.id back from the backend's MAC-based lookup,
+// and therefore reconnects with the same MQTT ClientID it had before. Without
+// forcing CleanStart=true on that first post-bootstrap connect, the broker would
+// resume the pre-wipe session and redeliver whatever un-acked command — e.g. the
+// very sysupgrade that caused the reboot — was still queued, causing an infinite
+// reflash loop.
+func TestRun_BootstrapForcesCleanStartOnNextConnect(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "bootstrap_token")
+	require.NoError(t, os.WriteFile(tokenPath, []byte("test-token\n"), 0600))
+	credsPath := filepath.Join(dir, "credentials")
+
+	mock := mqttclient.NewMockMQTTClient()
+	a := New(&Options{
+		Config:                    &config.Config{BrokerHost: "broker.local", BrokerPort: 8883},
+		MAC:                       "aa:bb:cc:dd:ee:ff",
+		MQTT:                      mock,
+		UCI:                       &uci.MockUCIRunner{},
+		FileAccess:                &filewriter.MockFileAccess{},
+		Version:                   "1.0.0",
+		SSHDaemon:                 &daemonDropbear,
+		AckRetryDelay:             time.Millisecond,
+		BootstrapTokenPath:        tokenPath,
+		CredsPath:                 credsPath,
+		BootstrapTokenWaitTimeout: time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- a.Run(ctx)
+	}()
+
+	// Wait for bootstrap/register, then reply on the tmp_id it actually generated
+	// (agent.go never sets a fixed TmpID, so bootstrap.Run() picks a random uuid).
+	require.Eventually(t, func() bool { return len(mock.Published) > 0 }, time.Second, time.Millisecond)
+	var req struct {
+		TmpID string `json:"tmp_id"`
+	}
+	require.NoError(t, json.Unmarshal(mock.Published[0].Payload, &req))
+	require.Equal(t, "bootstrap/register", mock.Published[0].Topic)
+
+	resp := struct {
+		DeviceID   string `json:"device_id"`
+		Secret     string `json:"secret"`
+		BrokerHost string `json:"broker_host"`
+		BrokerPort int    `json:"broker_port"`
+	}{DeviceID: "re-bootstrapped-device", Secret: "new-secret"}
+	payload, err := json.Marshal(resp)
+	require.NoError(t, err)
+	mock.SimulateMessage("bootstrap/"+req.TmpID+"/response", payload)
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-done
+
+	// [0] is bootstrap.Run()'s own temporary connect (ClientID "bootstrap-<tmp_id>");
+	// [1] is the real device session connect this fix targets.
+	require.Len(t, mock.ConnectOpts, 2)
+	assert.Equal(t, "re-bootstrapped-device", mock.ConnectOpts[1].Username)
+	assert.True(t, mock.ConnectOpts[1].CleanStart,
+		"first connect after a (re-)bootstrap must request CleanStart, or a stale queued "+
+			"command from before the wipe (e.g. the sysupgrade that triggered it) gets replayed")
+}
+
 // ---- handleLiveLogsControl tests -----------------------------------------------
 
 func newTestAgentWithLiveLogsHandler(mock *mqttclient.MockMQTTClient) (*Agent, *mqttLiveLogsHandler) {

@@ -803,6 +803,22 @@ func (a *Agent) Run(ctx context.Context) error {
 		if resp.BrokerPort > 0 {
 			a.cfg.BrokerPort = resp.BrokerPort
 		}
+
+		// Force CleanStart=true on the very next connect, independent of the
+		// sysupgrade sentinel below. The backend looks up devices by MAC on
+		// bootstrap/register, so a device that just re-bootstrapped (e.g. after a
+		// keep_config=false sysupgrade, which wipes /etc/waverms/ including
+		// credentials, but NOT the backend's device record) gets back the SAME
+		// device.id — and therefore the same MQTT ClientID — it had before. A
+		// keep_config=false sysupgrade never writes the sentinel (below) because
+		// it also wipes wherever that sentinel would live, so without this, the
+		// broker resumes the pre-flash persistent session and immediately
+		// redelivers the still-queued, un-acked sysupgrade command that caused
+		// this reboot in the first place — flashing again, forever, until the
+		// agent is disabled. A fresh bootstrap has no meaningful prior session to
+		// resume regardless of whether it's truly the device's first connect ever
+		// or a re-enrollment, so CleanStart=true is always correct here.
+		a.needsCleanStart.Store(true)
 	}
 
 	// Replace the global slog default with the MQTT-aware live-logs handler now that we
