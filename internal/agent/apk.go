@@ -26,17 +26,6 @@ type ApkReportData struct {
 	Installed []ApkPackageInfo `json:"installed"`
 }
 
-// ApkManagePayload is the inner payload for apk_manage commands.
-type ApkManagePayload struct {
-	Install []string `json:"install"`
-	Remove  []string `json:"remove"`
-}
-
-// pkgNameRe matches valid APK package names: start with alphanumeric, then
-// alphanumeric/dot/underscore/plus/hyphen. Used to sanitize names from the
-// server before passing them to exec.Command so shell injection is impossible.
-var pkgNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._+\-]*$`)
-
 // revisionRe matches the APK revision suffix like "r0", "r12".
 var revisionRe = regexp.MustCompile(`^r\d+$`)
 
@@ -140,55 +129,6 @@ func (a *Agent) handleApkReport(cmd Command) {
 	slog.Info("apk_report: complete", "cmd_id", cmd.CmdID, "installed", len(installed), "available", len(available))
 }
 
-// handleApkManage runs `apk del <remove>` then `apk add <install>` and ACKs ok/error.
-func (a *Agent) handleApkManage(cmd Command) {
-	var payload ApkManagePayload
-	if !a.decodeOrAck(cmd, &payload) {
-		return
-	}
-
-	// Sanitize package names to prevent command injection.
-	for _, name := range append(payload.Install, payload.Remove...) {
-		if !pkgNameRe.MatchString(name) {
-			a.publishAck(cmd.CmdID, "error", "invalid package name: "+name)
-			return
-		}
-	}
-
-	var errMsgs []string
-
-	if len(payload.Remove) > 0 {
-		slog.Debug("apk_manage: removing packages", "cmd_id", cmd.CmdID, "packages", payload.Remove)
-		args := append([]string{"del"}, payload.Remove...)
-		if _, err := a.uci.ExecCmd("apk", args...); err != nil {
-			errMsgs = append(errMsgs, "apk del: "+err.Error())
-		}
-	}
-
-	if len(payload.Install) > 0 {
-		slog.Debug("apk_manage: installing packages", "cmd_id", cmd.CmdID, "packages", payload.Install)
-		args := append([]string{"add"}, payload.Install...)
-		if _, err := a.uci.ExecCmd("apk", args...); err != nil {
-			errMsgs = append(errMsgs, "apk add: "+err.Error())
-		}
-	}
-
-	if len(errMsgs) > 0 {
-		a.publishAck(cmd.CmdID, "error", strings.Join(errMsgs, "; "))
-		return
-	}
-
-	// Re-fetch installed list after changes so the backend can update its records.
-	installedOut, err := a.runApkList("-I")
-	if err != nil {
-		slog.Warn("apk_manage: could not fetch post-manage installed list", "err", err)
-	}
-	installed := parseApkList(installedOut)
-
-	a.publishAckApk(cmd.CmdID, "ok", "", &ApkReportData{Installed: installed})
-	slog.Info("apk_manage: complete", "cmd_id", cmd.CmdID, "installed_count", len(installed))
-}
-
 // publishAckApk publishes an ACK carrying APK package data.
 func (a *Agent) publishAckApk(cmdID, status, output string, packages *ApkReportData) {
 	slog.Debug("publishing apk ack", "cmd_id", cmdID, "status", status)
@@ -216,15 +156,4 @@ func (a *Agent) publishAckApk(cmdID, status, output string, packages *ApkReportD
 	if err := a.mqtt.Publish(ctx, mqttclient.TopicAck(a.creds.DeviceID), payload, 1, false); err != nil {
 		slog.Error("publish apk ack", "cmd_id", cmdID, "err", err)
 	}
-}
-
-// installedPackages runs `apk list -I` and returns the parsed list for inclusion
-// in the info heartbeat payload.
-func (a *Agent) installedPackages() []ApkPackageInfo {
-	out, err := a.runApkList("-I")
-	if err != nil {
-		slog.Debug("installedPackages: apk list -I failed (apk not available?)", "err", err)
-		return nil
-	}
-	return parseApkList(out)
 }

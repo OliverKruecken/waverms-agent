@@ -198,19 +198,18 @@ type ServiceInfo struct {
 
 // InfoPayload is published to device/{id}/info every HeartbeatInterval seconds.
 type InfoPayload struct {
-	DeviceID          string           `json:"device_id"`
-	Hostname          string           `json:"hostname"`
-	UptimeSeconds     int64            `json:"uptime_seconds"`
-	AgentVersion      string           `json:"agent_version"`
-	Model             string           `json:"model"`
-	OpenWrtVersion    string           `json:"openwrt_version"`
-	Target            string           `json:"target"`
-	Profile           string           `json:"profile"`
-	VersionCode       string           `json:"version_code"`
-	Timestamp         string           `json:"timestamp"`
-	Capabilities      []string         `json:"capabilities"`
-	Services          []ServiceInfo    `json:"services,omitempty"`
-	InstalledPackages []ApkPackageInfo `json:"installed_packages,omitempty"`
+	DeviceID       string        `json:"device_id"`
+	Hostname       string        `json:"hostname"`
+	UptimeSeconds  int64         `json:"uptime_seconds"`
+	AgentVersion   string        `json:"agent_version"`
+	Model          string        `json:"model"`
+	OpenWrtVersion string        `json:"openwrt_version"`
+	Target         string        `json:"target"`
+	Profile        string        `json:"profile"`
+	VersionCode    string        `json:"version_code"`
+	Timestamp      string        `json:"timestamp"`
+	Capabilities   []string      `json:"capabilities"`
+	Services       []ServiceInfo `json:"services,omitempty"`
 }
 
 // hostKeyFingerprints returns a map of filename → lowercase hex SHA-256 for each
@@ -327,7 +326,6 @@ var supportedCapabilities = []string{
 	"tls_cert_remove",
 	"service_apply",
 	"apk_report",
-	"apk_manage",
 	"sysupgrade",
 	"log_control",
 	"logs_fetch",
@@ -656,7 +654,6 @@ func New(opts *Options) *Agent {
 		"tls_cert_remove":  a.handleTlsCertRemove,
 		"service_apply":    a.handleServiceApply,
 		"apk_report":       a.handleApkReport,
-		"apk_manage":       a.handleApkManage,
 		"sysupgrade":       a.handleSysupgrade,
 		"log_control":      a.handleLogControl,
 		"logs_fetch":       a.handleLogsFetch,
@@ -1043,21 +1040,19 @@ func (a *Agent) publishInfo(ctx context.Context) error {
 
 	caps := append(supportedCapabilities, "ssh_daemon:"+a.sshDaemon.Name)
 	services := discoverServices(a.uci, a.initdDir)
-	pkgs := a.installedPackages()
 	info := InfoPayload{
-		DeviceID:          a.creds.DeviceID,
-		Hostname:          hostname,
-		UptimeSeconds:     uptime,
-		AgentVersion:      a.version,
-		Model:             a.model,
-		OpenWrtVersion:    a.openwrtVersion,
-		Target:            a.target,
-		Profile:           a.profile,
-		VersionCode:       a.versionCode,
-		Timestamp:         time.Now().UTC().Format(time.RFC3339),
-		Capabilities:      caps,
-		Services:          services,
-		InstalledPackages: pkgs,
+		DeviceID:       a.creds.DeviceID,
+		Hostname:       hostname,
+		UptimeSeconds:  uptime,
+		AgentVersion:   a.version,
+		Model:          a.model,
+		OpenWrtVersion: a.openwrtVersion,
+		Target:         a.target,
+		Profile:        a.profile,
+		VersionCode:    a.versionCode,
+		Timestamp:      time.Now().UTC().Format(time.RFC3339),
+		Capabilities:   caps,
+		Services:       services,
 	}
 
 	payload, err := json.Marshal(info)
