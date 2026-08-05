@@ -13,7 +13,10 @@ import (
 // LogEntry is one parsed ubus logd record. Field names/types match logd's
 // log_fill_msg() (openwrt/ubox log/logd.c): msg is a string, id/priority/source
 // are uint32, and time is always milliseconds since epoch (tv_sec*1000 + tv_nsec/1e6) —
-// never seconds, so no unit-detection fallback is needed here.
+// never seconds, so no unit-detection fallback is needed here. Priority is the raw
+// combined syslog PRI logd parsed off the wire (facility*8 + severity — see
+// ubox log/syslog.c), not a plain 0-7 severity; passed through unmodified here,
+// the frontend's priorityToLevel() masks it down to just the severity bits.
 type LogEntry struct {
 	Time     int64  `json:"time"`
 	Priority int    `json:"priority"`
