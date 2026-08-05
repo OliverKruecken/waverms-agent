@@ -74,12 +74,26 @@ func main() {
 	} else {
 		logLevel.Set(slog.LevelInfo)
 	}
-	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+	// Prefer writing straight to the local syslog socket over plain stderr text:
+	// procd (per procd_set_param stdout/stderr 1 in the init script) tags every
+	// line it captures from stderr as LOG_ERR regardless of content, so routing
+	// normal logging through stderr made every record — including plain INFO
+	// lines — show up in logd, and therefore the live-logs snapshot, as an error.
+	// See internal/agent/syslog_handler.go. A missing /dev/log (devcontainer, CI,
+	// any non-OpenWrt host) falls back to the old stderr-text behavior.
+	var textHandler slog.Handler
+	if sh, sErr := agent.NewSyslogHandler(logLevel); sErr == nil {
+		textHandler = sh
+	} else {
+		textHandler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+		slog.SetDefault(slog.New(textHandler))
+		slog.Warn("syslog: failed to dial /dev/log, falling back to stderr text logging", "err", sErr)
+	}
 
 	// Persist agent activity to /etc/waverms/agent.log (survives reboot, unlike
 	// the syslog ring buffer) so a slow-reconnecting device can be diagnosed after
 	// the fact. A broken log file must never stop the agent from booting, so a
-	// failure here just falls back to stderr-only logging.
+	// failure here just falls back to whatever textHandler above resolved to.
 	activityLog, err := agent.NewActivityLogHandler(textHandler)
 	if err != nil {
 		slog.SetDefault(slog.New(textHandler))
