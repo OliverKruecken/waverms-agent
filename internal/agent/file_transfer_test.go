@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	mqttclient "github.com/OliverKruecken/waverms-agent/internal/mqtt"
@@ -220,6 +221,33 @@ func TestHTTPFileTransferDownloader_Success(t *testing.T) {
 	}
 	if fi.Mode().Perm() != 0755 {
 		t.Errorf("dest mode = %o, want 0755", fi.Mode().Perm())
+	}
+}
+
+func TestHTTPFileTransferDownloader_DestIsExistingDirectory(t *testing.T) {
+	content := []byte("usteer-ng binary")
+	sum := sha256Hex(content)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(content)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "usteer-ng")
+	if err := os.Mkdir(dest, 0755); err != nil {
+		t.Fatalf("mkdir dest: %v", err)
+	}
+
+	d := &HTTPFileTransferDownloader{}
+	err := d.Download(context.Background(), srv.URL, dest, sum, int64(len(content))+1024, 0755)
+	if err == nil {
+		t.Fatal("expected an error when the target path is an existing directory")
+	}
+	if !strings.Contains(err.Error(), "existing directory") {
+		t.Errorf("error = %q, want it to mention the target is an existing directory", err.Error())
+	}
+	if _, statErr := os.Stat(filepath.Join(dest, ".waverms-tmp")); statErr == nil {
+		t.Error("expected no .waverms-tmp to be left behind inside the directory")
 	}
 }
 

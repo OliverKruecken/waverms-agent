@@ -81,6 +81,10 @@ func (d *HTTPFileTransferDownloader) Download(ctx context.Context, url, destPath
 		return fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 	}
 
+	if info, err := os.Stat(destPath); err == nil && info.IsDir() {
+		return fmt.Errorf("target path %s is an existing directory, not a file", destPath)
+	}
+
 	dir := filepath.Dir(destPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
