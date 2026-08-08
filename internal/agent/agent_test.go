@@ -2240,3 +2240,31 @@ func TestPublishInfo_CapabilitiesContainLogLevelControl(t *testing.T) {
 	require.NoError(t, json.Unmarshal(mock.Published[0].Payload, &info))
 	assert.Contains(t, info.Capabilities, "log_level_control")
 }
+
+func TestDiscoverPackages_SkipsOpkgApkArtifactFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{
+		"usteer", "usteer-ng", "network", "usteer.apk-new", "network.orig", "firewall~",
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("config foo"), 0o644))
+	}
+
+	pkgs := discoverPackages(dir)
+
+	assert.ElementsMatch(t, []string{"usteer", "usteer-ng", "network"}, pkgs)
+}
+
+func TestDiscoverPackages_FallsBackWhenOnlyArtifactFilesPresent(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "usteer.apk-new"), []byte("config foo"), 0o644))
+
+	pkgs := discoverPackages(dir)
+
+	assert.Equal(t, fallbackStatePackages, pkgs)
+}
+
+func TestDiscoverPackages_FallsBackOnUnreadableDir(t *testing.T) {
+	pkgs := discoverPackages(filepath.Join(t.TempDir(), "does-not-exist"))
+
+	assert.Equal(t, fallbackStatePackages, pkgs)
+}

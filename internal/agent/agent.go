@@ -338,16 +338,26 @@ var supportedCapabilities = []string{
 // fallbackStatePackages is used only when /etc/config cannot be read.
 var fallbackStatePackages = []string{"system", "network", "wireless", "firewall", "dhcp"}
 
-// discoverPackages lists all regular files in /etc/config and returns them as
+// packageNameRe matches valid UCI package names: alphanumeric, dash, underscore.
+// This excludes opkg/apk artifact files that land in /etc/config (e.g. "usteer.apk-new",
+// "dropbear-opkg", "network.orig", "firewall~") which are not real UCI packages and make
+// "uci export" fail.
+var packageNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// discoverPackages lists all regular files in configDir and returns them as
 // UCI package names. Falls back to fallbackStatePackages on any read error.
-func discoverPackages() []string {
-	entries, err := os.ReadDir("/etc/config")
+func discoverPackages(configDir string) []string {
+	entries, err := os.ReadDir(configDir)
 	if err != nil {
 		return fallbackStatePackages
 	}
 	pkgs := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if e.Type().IsRegular() {
+			if !packageNameRe.MatchString(e.Name()) {
+				slog.Debug("discoverPackages: skipping non-package file in /etc/config", "name", e.Name())
+				continue
+			}
 			pkgs = append(pkgs, e.Name())
 		} else if e.Type()&os.ModeSymlink != 0 {
 			// Some OpenWrt setups symlink UCI packages into /etc/config/.
@@ -1240,7 +1250,7 @@ func (a *Agent) handleLogLevelControl(_ string, payload []byte) {
 // Packages that fail to export are skipped and logged.
 func (a *Agent) publishState(ctx context.Context, trigger string, pkgs []string) error {
 	if len(pkgs) == 0 {
-		pkgs = discoverPackages()
+		pkgs = discoverPackages("/etc/config")
 	}
 	slog.Debug("publishing state", "trigger", trigger, "packages", pkgs)
 
