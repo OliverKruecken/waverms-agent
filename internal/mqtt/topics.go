@@ -68,3 +68,8 @@ func TopicLogLevelControl(deviceID string) string {
 func TopicUbusStatus(deviceID string) string {
 	return fmt.Sprintf("device/%s/ubus-status", deviceID)
 }
+
+// TopicUbusEvent returns the topic the agent publishes live ubus_listen events to (QoS 1, no retain).
+func TopicUbusEvent(deviceID string) string {
+	return fmt.Sprintf("device/%s/ubus-event", deviceID)
+}

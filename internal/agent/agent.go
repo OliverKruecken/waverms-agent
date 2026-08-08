@@ -331,6 +331,7 @@ var supportedCapabilities = []string{
 	"log_level_control",
 	"ubus_call",
 	"ubus_watch",
+	"ubus_listen",
 	"shell_exec",
 	"file_transfer",
 }
@@ -424,6 +425,8 @@ type Options struct {
 	FirmwareDownloader FirmwareDownloader
 	// FileTransferDownloader downloads file-transfer-template files. Defaults to HTTPFileTransferDownloader.
 	FileTransferDownloader FileTransferDownloader
+	// UbusListenStarter starts standing `ubus listen` subprocesses for ubus_listen. Defaults to RealUbusListenStarter.
+	UbusListenStarter UbusListenStarter
 	// SysupgradeRunner tests and executes sysupgrade. Defaults to OSSysupgradeRunner.
 	SysupgradeRunner SysupgradeRunner
 	// DiskSpaceChecker reports available disk space. Defaults to StatfsDiskSpaceChecker.
@@ -478,6 +481,7 @@ type Agent struct {
 	passwordSetter         PasswordSetter
 	firmwareDownloader     FirmwareDownloader
 	fileTransferDownloader FileTransferDownloader
+	ubusListenStarter      UbusListenStarter
 	sysupgradeRunner       SysupgradeRunner
 	diskSpaceChecker       DiskSpaceChecker
 	version                string
@@ -532,6 +536,13 @@ type Agent struct {
 	// reconnect — the next ubus_watch for that key always starts fresh.
 	watchesMu sync.Mutex
 	watches   map[watchKey]chan struct{}
+
+	// listensMu protects listens, the registry of active ubus_listen
+	// goroutines keyed by event name — same idempotent-re-dispatch contract
+	// as watches above, just keyed by a bare event name instead of
+	// (object, method) since `ubus listen` takes one argument.
+	listensMu sync.Mutex
+	listens   map[string]chan struct{}
 
 	// cleanStartSentinelPath is the file written before sysupgrade so the first
 	// post-reboot connect can use CleanStart=true to discard re-delivered commands.
@@ -605,6 +616,10 @@ func New(opts *Options) *Agent {
 	if ftd == nil {
 		ftd = &HTTPFileTransferDownloader{}
 	}
+	uls := opts.UbusListenStarter
+	if uls == nil {
+		uls = &RealUbusListenStarter{}
+	}
 	sr := opts.SysupgradeRunner
 	if sr == nil {
 		sr = &OSSysupgradeRunner{}
@@ -651,6 +666,7 @@ func New(opts *Options) *Agent {
 		passwordSetter:            ps,
 		firmwareDownloader:        fd,
 		fileTransferDownloader:    ftd,
+		ubusListenStarter:         uls,
 		sysupgradeRunner:          sr,
 		diskSpaceChecker:          dc,
 		version:                   opts.Version,
@@ -664,6 +680,7 @@ func New(opts *Options) *Agent {
 		cleanStartSentinelPath:    sentinelPath,
 		ackRetryDelay:             ackRetryDelay,
 		watches:                   make(map[watchKey]chan struct{}),
+		listens:                   make(map[string]chan struct{}),
 	}
 
 	// If the sentinel file exists from a prior sysupgrade, request a clean
@@ -690,6 +707,8 @@ func New(opts *Options) *Agent {
 		"ubus_call":        a.handleUbusCall,
 		"ubus_watch":       a.handleUbusWatch,
 		"ubus_unwatch":     a.handleUbusUnwatch,
+		"ubus_listen":      a.handleUbusListen,
+		"ubus_unlisten":    a.handleUbusUnlisten,
 		"shell_exec":       a.handleShellExec,
 		"file_transfer":    a.handleFileTransfer,
 	}

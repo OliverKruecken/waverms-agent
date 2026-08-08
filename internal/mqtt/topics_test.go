@@ -37,3 +37,7 @@ func TestTopicLogLevelControl(t *testing.T) {
 func TestTopicUbusStatus(t *testing.T) {
 	assert.Equal(t, "device/abc-123/ubus-status", TopicUbusStatus("abc-123"))
 }
+
+func TestTopicUbusEvent(t *testing.T) {
+	assert.Equal(t, "device/abc-123/ubus-event", TopicUbusEvent("abc-123"))
+}
