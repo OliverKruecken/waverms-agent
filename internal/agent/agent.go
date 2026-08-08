@@ -330,6 +330,7 @@ var supportedCapabilities = []string{
 	"logs_fetch",
 	"log_level_control",
 	"ubus_call",
+	"ubus_watch",
 }
 
 // fallbackStatePackages is used only when /etc/config cannot be read.
@@ -508,6 +509,15 @@ type Agent struct {
 	// session within its 2-minute window.
 	watchdogActive atomic.Bool
 
+	// watchesMu protects watches, the registry of active ubus_watch goroutines
+	// keyed by (object, method). A ubus_watch for a key already present is a
+	// no-op ack — this is what makes the backend's every-report-cycle re-send
+	// idempotent. Each watch goroutine removes its own entry on exit (session
+	// disconnect or explicit ubus_unwatch), so a stale entry never survives a
+	// reconnect — the next ubus_watch for that key always starts fresh.
+	watchesMu sync.Mutex
+	watches   map[watchKey]chan struct{}
+
 	// cleanStartSentinelPath is the file written before sysupgrade so the first
 	// post-reboot connect can use CleanStart=true to discard re-delivered commands.
 	cleanStartSentinelPath string
@@ -633,6 +643,7 @@ func New(opts *Options) *Agent {
 		logLevel:                  opts.LogLevel,
 		cleanStartSentinelPath:    sentinelPath,
 		ackRetryDelay:             ackRetryDelay,
+		watches:                   make(map[watchKey]chan struct{}),
 	}
 
 	// If the sentinel file exists from a prior sysupgrade, request a clean
@@ -657,6 +668,8 @@ func New(opts *Options) *Agent {
 		"log_control":      a.handleLogControl,
 		"logs_fetch":       a.handleLogsFetch,
 		"ubus_call":        a.handleUbusCall,
+		"ubus_watch":       a.handleUbusWatch,
+		"ubus_unwatch":     a.handleUbusUnwatch,
 	}
 	return a
 }
