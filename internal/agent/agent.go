@@ -332,6 +332,7 @@ var supportedCapabilities = []string{
 	"ubus_call",
 	"ubus_watch",
 	"shell_exec",
+	"file_transfer",
 }
 
 // fallbackStatePackages is used only when /etc/config cannot be read.
@@ -411,6 +412,8 @@ type Options struct {
 	PasswordSetter PasswordSetter
 	// FirmwareDownloader downloads firmware images. Defaults to HTTPFirmwareDownloader.
 	FirmwareDownloader FirmwareDownloader
+	// FileTransferDownloader downloads file-transfer-template files. Defaults to HTTPFileTransferDownloader.
+	FileTransferDownloader FileTransferDownloader
 	// SysupgradeRunner tests and executes sysupgrade. Defaults to OSSysupgradeRunner.
 	SysupgradeRunner SysupgradeRunner
 	// DiskSpaceChecker reports available disk space. Defaults to StatfsDiskSpaceChecker.
@@ -451,24 +454,25 @@ type Options struct {
 
 // Agent is the main runtime component.
 type Agent struct {
-	cfg                *config.Config
-	creds              *config.Credentials
-	mac                string
-	model              string
-	openwrtVersion     string
-	target             string
-	profile            string
-	versionCode        string
-	mqtt               mqttclient.MQTTClient
-	uci                uci.UCIRunner
-	fileAccess         filewriter.FileAccess
-	passwordSetter     PasswordSetter
-	firmwareDownloader FirmwareDownloader
-	sysupgradeRunner   SysupgradeRunner
-	diskSpaceChecker   DiskSpaceChecker
-	version            string
-	sshDaemon          sshDaemonInfo
-	initdDir           string
+	cfg                    *config.Config
+	creds                  *config.Credentials
+	mac                    string
+	model                  string
+	openwrtVersion         string
+	target                 string
+	profile                string
+	versionCode            string
+	mqtt                   mqttclient.MQTTClient
+	uci                    uci.UCIRunner
+	fileAccess             filewriter.FileAccess
+	passwordSetter         PasswordSetter
+	firmwareDownloader     FirmwareDownloader
+	fileTransferDownloader FileTransferDownloader
+	sysupgradeRunner       SysupgradeRunner
+	diskSpaceChecker       DiskSpaceChecker
+	version                string
+	sshDaemon              sshDaemonInfo
+	initdDir               string
 
 	bootstrapTokenPath        string
 	bootstrapTokenWaitTimeout time.Duration
@@ -587,6 +591,10 @@ func New(opts *Options) *Agent {
 	if fd == nil {
 		fd = &HTTPFirmwareDownloader{}
 	}
+	ftd := opts.FileTransferDownloader
+	if ftd == nil {
+		ftd = &HTTPFileTransferDownloader{}
+	}
 	sr := opts.SysupgradeRunner
 	if sr == nil {
 		sr = &OSSysupgradeRunner{}
@@ -632,6 +640,7 @@ func New(opts *Options) *Agent {
 		fileAccess:                fw,
 		passwordSetter:            ps,
 		firmwareDownloader:        fd,
+		fileTransferDownloader:    ftd,
 		sysupgradeRunner:          sr,
 		diskSpaceChecker:          dc,
 		version:                   opts.Version,
@@ -672,6 +681,7 @@ func New(opts *Options) *Agent {
 		"ubus_watch":       a.handleUbusWatch,
 		"ubus_unwatch":     a.handleUbusUnwatch,
 		"shell_exec":       a.handleShellExec,
+		"file_transfer":    a.handleFileTransfer,
 	}
 	return a
 }
