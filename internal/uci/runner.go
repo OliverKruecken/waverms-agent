@@ -4,6 +4,7 @@ package uci
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -28,6 +29,12 @@ type UCIRunner interface {
 	ExecRaw(args ...string) (string, error)
 	// ExecCmd runs an arbitrary executable directly (not via uci), e.g. an init script.
 	ExecCmd(path string, args ...string) (string, error)
+	// ExecShell runs command through /bin/sh -c, capturing combined stdout+stderr, bounded by
+	// timeout. Unlike ExecCmd/ExecRaw, this genuinely invokes a shell — pipes, redirects, and
+	// multi-statement scripts all work as a real script would. The returned exitCode reflects the
+	// process's actual exit status even when non-zero (that's a legitimate result, not a failure);
+	// err is only set for exec-level failures (command not found, timeout, kill).
+	ExecShell(command string, timeout time.Duration) (output string, exitCode int, err error)
 }
 
 // RealUCIRunner calls the uci CLI via os/exec.
@@ -113,13 +120,37 @@ func (r *RealUCIRunner) ExecCmd(path string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+func (r *RealUCIRunner) ExecShell(command string, timeout time.Duration) (string, int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/bin/sh", "-c", command).CombinedOutput()
+	output := strings.TrimSpace(string(out))
+	// Check the deadline first: a killed-by-timeout process still satisfies errors.As(err,
+	// &exitErr) below (a signal-terminated process is a legitimate *exec.ExitError with
+	// ExitCode() == -1), which would otherwise be indistinguishable from a script that
+	// genuinely, deliberately exits -1 on its own.
+	if ctx.Err() == context.DeadlineExceeded {
+		return output, -1, fmt.Errorf("sh -c: timed out after %s", timeout)
+	}
+	if err == nil {
+		return output, 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return output, exitErr.ExitCode(), nil
+	}
+	return output, -1, fmt.Errorf("sh -c: %w", err)
+}
+
 // MockUCIRunner records all calls for test assertions.
 // Inject errors via the Errors map keyed by the command string.
 // Inject output via the Results map keyed by the command string.
+// Inject a non-zero ExecShell exit code via the ExitCodes map keyed by "shell <command>".
 type MockUCIRunner struct {
-	Calls   []string
-	Errors  map[string]error
-	Results map[string]string
+	Calls     []string
+	Errors    map[string]error
+	Results   map[string]string
+	ExitCodes map[string]int
 }
 
 func (m *MockUCIRunner) err(cmd string) error {
@@ -227,4 +258,18 @@ func (m *MockUCIRunner) ExecCmd(path string, args ...string) (string, error) {
 		}
 	}
 	return "", m.err(cmd)
+}
+
+func (m *MockUCIRunner) ExecShell(command string, _ time.Duration) (string, int, error) {
+	cmd := "shell " + command
+	m.record(cmd)
+	exitCode := 0
+	if m.ExitCodes != nil {
+		exitCode = m.ExitCodes[cmd]
+	}
+	out := ""
+	if m.Results != nil {
+		out = m.Results[cmd]
+	}
+	return out, exitCode, m.err(cmd)
 }

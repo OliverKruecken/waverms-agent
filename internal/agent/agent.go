@@ -331,6 +331,7 @@ var supportedCapabilities = []string{
 	"log_level_control",
 	"ubus_call",
 	"ubus_watch",
+	"shell_exec",
 }
 
 // fallbackStatePackages is used only when /etc/config cannot be read.
@@ -670,6 +671,7 @@ func New(opts *Options) *Agent {
 		"ubus_call":        a.handleUbusCall,
 		"ubus_watch":       a.handleUbusWatch,
 		"ubus_unwatch":     a.handleUbusUnwatch,
+		"shell_exec":       a.handleShellExec,
 	}
 	return a
 }
