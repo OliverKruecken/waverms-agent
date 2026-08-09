@@ -618,7 +618,7 @@ func New(opts *Options) *Agent {
 	}
 	uls := opts.UbusListenStarter
 	if uls == nil {
-		uls = &RealUbusListenStarter{}
+		uls = &RealUbusListenStarter{UCI: opts.UCI}
 	}
 	sr := opts.SysupgradeRunner
 	if sr == nil {

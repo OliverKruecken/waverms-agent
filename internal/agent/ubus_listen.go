@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -22,13 +23,16 @@ var (
 	ubusListenStableAfter = 30 * time.Second
 )
 
-// ubusEventNameRe allows ubus's own event-name vocabulary plus a trailing
-// wildcard (ubus listen supports "prefix*" patterns at the libubus level).
-var ubusEventNameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]+\*?$`)
+// ubusEventNameRe restricts Event to ubus's own notify-type vocabulary
+// (alphanumeric, underscore, dot, dash). It's compared for an exact match
+// against each received line's own type key (see ubusLineMatchesType) —
+// unlike a literal `ubus listen <event>` argument, it is never passed to a
+// ubus command line (see RealUbusListenStarter).
+var ubusEventNameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 
 // UbusListenPayload is the inner payload for type "ubus_listen": start (or
-// confirm) a standing `ubus listen <event>` subprocess whose every emitted
-// line is published verbatim (wrapped, see publishUbusEvent) to
+// confirm) a standing subscription (see RealUbusListenStarter) whose lines
+// matching Event are published (wrapped, see publishUbusEvent) to
 // device/{id}/ubus-event, until a matching ubus_unlisten arrives or the
 // session ends. Unlike ubus_watch, there is no interval — events are pushed
 // the instant ubus emits them.
@@ -43,8 +47,7 @@ type UbusUnlistenPayload struct {
 
 // handleUbusListen starts a standing ubus listen, or no-ops if one for the
 // same event is already running — mirrors ubus_watch's dedup contract, keyed
-// by event name alone since `ubus listen` takes one bare argument, not an
-// object/method pair.
+// by event name alone.
 func (a *Agent) handleUbusListen(cmd Command) {
 	var payload UbusListenPayload
 	if !a.decodeOrAck(cmd, &payload) {
@@ -146,6 +149,13 @@ func (a *Agent) runUbusListen(event string, stop chan struct{}) {
 		done := make(chan struct{})
 		go func() {
 			for line := range proc.Lines() {
+				// proc.Lines() is unfiltered — a subscription to a hostapd
+				// object yields every notify type it sends (assoc/auth/probe
+				// interleaved), not just the one this registration asked
+				// for. See RealUbusListenStarter's doc comment.
+				if !ubusLineMatchesType(line, event) {
+					continue
+				}
 				a.publishUbusEvent(event, line)
 			}
 			close(done)
@@ -177,6 +187,22 @@ func (a *Agent) runUbusListen(event string, stop chan struct{}) {
 		}
 		backoff = nextUbusListenBackoff(backoff)
 	}
+}
+
+// ubusLineMatchesType reports whether a raw `{ "<type>": {...} }` ubus notify
+// line's own type key equals eventType — used to filter
+// RealUbusListenStarter's unfiltered per-object stream (assoc/auth/probe all
+// interleaved on one subscription) down to the single type this listen
+// registration asked for. Malformed lines never match (dropped, not
+// published) — the agent still doesn't interpret ubus output, this only
+// peeks at the outer key.
+func ubusLineMatchesType(line, eventType string) bool {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(line), &m); err != nil {
+		return false
+	}
+	_, ok := m[eventType]
+	return ok
 }
 
 // publishUbusEvent wraps one raw ubus JSON line — deliberately not

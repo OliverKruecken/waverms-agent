@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -171,6 +172,52 @@ func TestRunUbusListen_PublishesEachLineToUbusEventTopic(t *testing.T) {
 	a.listensMu.Unlock()
 }
 
+func TestRunUbusListen_FiltersOutNonMatchingEventTypes(t *testing.T) {
+	// RealUbusListenStarter's stream is unfiltered — a subscription to a
+	// hostapd object also yields "auth"/"probe" lines interleaved with
+	// "assoc" ones. A registration for "assoc" must drop those, not forward
+	// them mislabeled as assoc.
+	starter := &MockUbusListenStarter{}
+	mqttMock := mqttclient.NewMockMQTTClient()
+	a := newUbusListenTestAgent(mqttMock, starter)
+
+	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
+	waitForCondition(t, func() bool { return len(starter.StartedProcesses) == 1 })
+	proc := starter.StartedProcesses[0]
+
+	proc.Push(`{ "probe": {"address":"aa:bb:cc:dd:ee:99"} }`)
+	proc.Push(`{ "auth": {"address":"aa:bb:cc:dd:ee:98"} }`)
+	proc.Push(`{ "assoc": {"address":"aa:bb:cc:dd:ee:01"} }`)
+
+	waitForCondition(t, func() bool {
+		for _, m := range mqttMock.PublishedSnapshot() {
+			if m.Topic == "device/test-device-uuid/ubus-event" {
+				return true
+			}
+		}
+		return false
+	})
+	// Give any wrongly-forwarded probe/auth line a chance to also land.
+	time.Sleep(20 * time.Millisecond)
+
+	var ubusEventMsgs []mqttclient.PublishedMsg
+	for _, m := range mqttMock.PublishedSnapshot() {
+		if m.Topic == "device/test-device-uuid/ubus-event" {
+			ubusEventMsgs = append(ubusEventMsgs, m)
+		}
+	}
+	if len(ubusEventMsgs) != 1 {
+		t.Fatalf("published %d ubus-event messages, want exactly 1 (assoc only): %+v", len(ubusEventMsgs), ubusEventMsgs)
+	}
+	if !bytes.Contains(ubusEventMsgs[0].Payload, []byte("aa:bb:cc:dd:ee:01")) {
+		t.Errorf("published message = %s, want the assoc line's address", ubusEventMsgs[0].Payload)
+	}
+
+	a.listensMu.Lock()
+	close(a.listens["assoc"])
+	a.listensMu.Unlock()
+}
+
 func TestRunUbusListen_RestartsAfterUnexpectedExit(t *testing.T) {
 	orig := ubusListenBaseBackoff
 	ubusListenBaseBackoff = time.Millisecond
@@ -240,6 +287,26 @@ func TestPublishInfo_CapabilitiesContainUbusListen(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected capabilities to contain ubus_listen, got %+v", info.Capabilities)
+	}
+}
+
+func TestUbusLineMatchesType(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"matching type", `{ "assoc": {"address":"aa:bb:cc:dd:ee:01"} }`, true},
+		{"non-matching type", `{ "probe": {"address":"aa:bb:cc:dd:ee:01"} }`, false},
+		{"malformed json", `not json at all`, false},
+		{"empty line", ``, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ubusLineMatchesType(tc.line, "assoc"); got != tc.want {
+				t.Errorf("ubusLineMatchesType(%q, \"assoc\") = %v, want %v", tc.line, got, tc.want)
+			}
+		})
 	}
 }
 

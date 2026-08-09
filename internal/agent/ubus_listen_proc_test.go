@@ -7,11 +7,16 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/OliverKruecken/waverms-agent/internal/uci"
 )
 
 // writeFakeUbus creates a fake `ubus` binary on $PATH for the duration of the
 // test, running script as its body. No real device/ubus binary is ever
-// required to run this suite.
+// required to run this suite. script receives "$1" as the subcommand
+// (RealUbusListenStarter now shells out to both `ubus list` and
+// `ubus subscribe <objects...>`), so fakes that care which one was invoked
+// should branch on it.
 func writeFakeUbus(t *testing.T, script string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -22,13 +27,30 @@ func writeFakeUbus(t *testing.T, script string) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-func TestRealUbusListenStarter_LinesArriveInOrder(t *testing.T) {
-	writeFakeUbus(t, `
-echo '{ "assoc": {"address":"aa:bb:cc:dd:ee:01"} }'
-echo '{ "assoc": {"address":"aa:bb:cc:dd:ee:02"} }'
-`)
+// fakeUbusListAndSubscribe is the common fake `ubus` script body: `ubus list`
+// reports one hostapd BSS object (plus a non-hostapd one, to exercise the
+// discovery filter), `ubus subscribe ...` streams the given lines.
+func fakeUbusListAndSubscribe(subscribeLines string) string {
+	return `
+case "$1" in
+  list)
+    echo "hostapd.phy0-ap0"
+    echo "network.interface"
+    ;;
+  subscribe)
+` + subscribeLines + `
+    ;;
+esac
+`
+}
 
-	s := &RealUbusListenStarter{}
+func TestRealUbusListenStarter_LinesArriveInOrder(t *testing.T) {
+	writeFakeUbus(t, fakeUbusListAndSubscribe(`
+    echo '{ "assoc": {"address":"aa:bb:cc:dd:ee:01"} }'
+    echo '{ "assoc": {"address":"aa:bb:cc:dd:ee:02"} }'
+`))
+
+	s := &RealUbusListenStarter{UCI: &uci.RealUCIRunner{}}
 	proc, err := s.Start(context.Background(), "assoc")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -54,12 +76,12 @@ echo '{ "assoc": {"address":"aa:bb:cc:dd:ee:02"} }'
 }
 
 func TestRealUbusListenStarter_StopKillsProcessAndUnblocksWait(t *testing.T) {
-	writeFakeUbus(t, `
-echo '{ "assoc": {} }'
-sleep 30
-`)
+	writeFakeUbus(t, fakeUbusListAndSubscribe(`
+    echo '{ "assoc": {} }'
+    sleep 30
+`))
 
-	s := &RealUbusListenStarter{}
+	s := &RealUbusListenStarter{UCI: &uci.RealUCIRunner{}}
 	proc, err := s.Start(context.Background(), "assoc")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -88,10 +110,64 @@ sleep 30
 func TestRealUbusListenStarter_StartErrorOnMissingBinary(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // empty dir — no ubus binary anywhere on PATH
 
-	s := &RealUbusListenStarter{}
+	s := &RealUbusListenStarter{UCI: &uci.RealUCIRunner{}}
 	_, err := s.Start(context.Background(), "assoc")
 	if err == nil {
 		t.Fatal("expected an error when the ubus binary cannot be found")
+	}
+}
+
+func TestRealUbusListenStarter_StartErrorWhenNoHostapdObjects(t *testing.T) {
+	// `ubus list` reports objects, but none of them are hostapd's — Start
+	// should fail rather than launching `ubus subscribe` with no arguments.
+	writeFakeUbus(t, `
+case "$1" in
+  list)
+    echo "network.interface"
+    echo "system"
+    ;;
+esac
+`)
+
+	s := &RealUbusListenStarter{UCI: &uci.RealUCIRunner{}}
+	_, err := s.Start(context.Background(), "assoc")
+	if err == nil {
+		t.Fatal("expected an error when no hostapd ubus objects are found")
+	}
+}
+
+func TestHostapdObjects_FiltersToBSSObjectsOnly(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Results: map[string]string{
+			"cmd ubus list": "hostapd\nhostapd-auth\nhostapd.phy0-ap0\nhostapd.phy0-ap1\nnetwork.interface\n",
+		},
+	}
+
+	got, err := hostapdObjects(mock)
+	if err != nil {
+		t.Fatalf("hostapdObjects: %v", err)
+	}
+
+	want := []string{"hostapd.phy0-ap0", "hostapd.phy0-ap1"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestHostapdObjects_PropagatesExecError(t *testing.T) {
+	boom := errors.New("boom")
+	mock := &uci.MockUCIRunner{
+		Errors: map[string]error{"cmd ubus list": boom},
+	}
+
+	_, err := hostapdObjects(mock)
+	if err == nil {
+		t.Fatal("expected an error to propagate from ExecCmd")
 	}
 }
 
