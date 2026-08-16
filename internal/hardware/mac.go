@@ -32,10 +32,31 @@ func getBurnedInMAC(sysDir, dtBase string) (string, error) {
 	return getFirstPhysicalMAC(sysDir)
 }
 
+// macCandidate is a physical interface whose of_node places it in the same
+// device-tree family as the label-mac-device node.
+type macCandidate struct {
+	name string
+	mac  string
+}
+
 // getLabelMAC resolves the MAC via the label-mac-device device-tree alias:
 // it names the DT node of the interface whose address is the device's label
 // MAC, so we read that alias and find which /sys/class/net interface's
 // of_node symlink points at the same node.
+//
+// Some drivers (e.g. MediaTek's mtk_eth_soc, used on GL.iNet GL-MT6000 and
+// other filogic boards) register every physical port as a separate netdev
+// under one shared platform device, so /sys/class/net/{iface}/device/of_node
+// resolves to the parent Ethernet controller node for all of them -- it
+// can't identify one specific gmac sub-node. When no interface's of_node
+// matches the label node exactly, we fall back to the interfaces whose
+// of_node is an ancestor of it (i.e. share the labeled port's controller)
+// and pick the smallest same-OUI address among them: per this SoC family's
+// nvmem-cells convention, the label port is always the unmodified factory
+// base address (nvmem-cells offset 0), and every sibling port is that base
+// plus a positive per-port offset -- the same "base + N" convention this
+// project's own ${LOCAL_MAC} derivation relies on (see
+// docs/mac_address_derivation.md).
 func getLabelMAC(sysDir, dtBase string) (string, error) {
 	aliasPath := filepath.Join(dtBase, "aliases", "label-mac-device")
 	data, err := os.ReadFile(aliasPath)
@@ -54,6 +75,7 @@ func getLabelMAC(sysDir, dtBase string) (string, error) {
 	}
 
 	const dtMarker = "devicetree/base"
+	var family []macCandidate
 	for _, e := range entries {
 		target, err := os.Readlink(filepath.Join(sysDir, e.Name(), "device", "of_node"))
 		if err != nil {
@@ -61,24 +83,44 @@ func getLabelMAC(sysDir, dtBase string) (string, error) {
 		}
 
 		_, nodePath, found := strings.Cut(target, dtMarker)
-		if !found || nodePath != labelNode {
+		if !found {
+			continue
+		}
+		if nodePath != labelNode && !strings.HasPrefix(labelNode, nodePath+"/") {
 			continue
 		}
 
 		addrPath := filepath.Join(sysDir, e.Name(), "address")
 		addr, err := os.ReadFile(addrPath)
 		if err != nil {
-			return "", fmt.Errorf("read %s: %w", addrPath, err)
+			continue
 		}
 
 		mac := strings.TrimSpace(string(addr))
 		if mac == "" || mac == "00:00:00:00:00:00" {
-			return "", fmt.Errorf("label-mac-device interface %s has no usable MAC", e.Name())
+			continue
 		}
-		return mac, nil
+
+		if nodePath == labelNode {
+			return mac, nil
+		}
+		family = append(family, macCandidate{name: e.Name(), mac: mac})
 	}
 
-	return "", fmt.Errorf("no interface matches label-mac-device alias %s", labelNode)
+	if len(family) == 0 {
+		return "", fmt.Errorf("no interface's of_node is the label-mac-device node %s or an ancestor of it", labelNode)
+	}
+
+	best := family[0]
+	for _, c := range family[1:] {
+		if c.mac[:8] != best.mac[:8] {
+			return "", fmt.Errorf("label-mac-device family has mismatched OUIs (%s vs %s), refusing to guess", c.mac, best.mac)
+		}
+		if c.mac < best.mac {
+			best = c
+		}
+	}
+	return best.mac, nil
 }
 
 // getFirstPhysicalMAC is the testable inner function that accepts a sysDir

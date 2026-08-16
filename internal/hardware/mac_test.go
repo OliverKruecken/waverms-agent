@@ -140,6 +140,61 @@ func TestGetBurnedInMAC_FallsBackWhenNoInterfaceMatchesAlias(t *testing.T) {
 	assert.Equal(t, "aa:bb:cc:dd:ee:ff", mac)
 }
 
+// TestGetBurnedInMAC_SharedOfNode reproduces the real GL.iNet GL-MT6000
+// scenario: mtk_eth_soc registers both gmac0 and gmac1 as separate netdevs
+// under one shared platform device, so both eth0 and eth1 report the parent
+// controller node as their of_node -- neither matches the label-mac-device
+// leaf node (mac@1) exactly. The label is resolved by falling back to the
+// smallest same-OUI address among the interfaces sharing that ancestor node.
+func TestGetBurnedInMAC_SharedOfNode(t *testing.T) {
+	sysDir := t.TempDir()
+	dtBase := t.TempDir()
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dtBase, "aliases"), 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dtBase, "aliases", "label-mac-device"),
+		[]byte("/soc/ethernet@15100000/mac@1\x00"), 0644))
+
+	// Both interfaces share the parent controller node as their of_node --
+	// neither is the mac@1 leaf itself.
+	require.NoError(t, os.MkdirAll(filepath.Join(sysDir, "eth0"), 0755))
+	makeOfNodeLink(t, sysDir, "eth0", "/soc/ethernet@15100000")
+	require.NoError(t, os.WriteFile(filepath.Join(sysDir, "eth0", "address"), []byte("94:83:c4:d4:ca:48\n"), 0644))
+
+	require.NoError(t, os.MkdirAll(filepath.Join(sysDir, "eth1"), 0755))
+	makeOfNodeLink(t, sysDir, "eth1", "/soc/ethernet@15100000")
+	require.NoError(t, os.WriteFile(filepath.Join(sysDir, "eth1", "address"), []byte("94:83:c4:d4:ca:46\n"), 0644))
+
+	mac, err := getBurnedInMAC(sysDir, dtBase)
+	require.NoError(t, err)
+	assert.Equal(t, "94:83:c4:d4:ca:46", mac)
+}
+
+func TestGetBurnedInMAC_RefusesMismatchedOUIFamily(t *testing.T) {
+	sysDir := t.TempDir()
+	dtBase := t.TempDir()
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dtBase, "aliases"), 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dtBase, "aliases", "label-mac-device"),
+		[]byte("/soc/ethernet@15100000/mac@1\x00"), 0644))
+
+	require.NoError(t, os.MkdirAll(filepath.Join(sysDir, "eth0"), 0755))
+	makeOfNodeLink(t, sysDir, "eth0", "/soc/ethernet@15100000")
+	require.NoError(t, os.WriteFile(filepath.Join(sysDir, "eth0", "address"), []byte("94:83:c4:d4:ca:48\n"), 0644))
+
+	// Different OUI entirely -- not a real per-port sibling, so the family
+	// heuristic must refuse to guess rather than pick one arbitrarily.
+	require.NoError(t, os.MkdirAll(filepath.Join(sysDir, "eth1"), 0755))
+	makeOfNodeLink(t, sysDir, "eth1", "/soc/ethernet@15100000")
+	require.NoError(t, os.WriteFile(filepath.Join(sysDir, "eth1", "address"), []byte("aa:bb:cc:dd:ee:ff\n"), 0644))
+
+	// Falls all the way back to the plain first-physical-device scan.
+	mac, err := getBurnedInMAC(sysDir, dtBase)
+	require.NoError(t, err)
+	assert.Equal(t, "94:83:c4:d4:ca:48", mac)
+}
+
 func TestGetFirstPhysicalMAC_MissingAddressFile(t *testing.T) {
 	sysDir := t.TempDir()
 
