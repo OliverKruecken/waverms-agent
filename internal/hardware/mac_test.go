@@ -70,6 +70,76 @@ func TestGetFirstPhysicalMAC_SkipsZeroMAC(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// makeOfNodeLink creates a /sys/class/net/{iface}/device/of_node symlink
+// whose target string contains the given devicetree node path, mimicking
+// the real sysfs layout without needing the target to actually exist.
+func makeOfNodeLink(t *testing.T, sysDir, iface, dtNodePath string) {
+	t.Helper()
+	deviceDir := filepath.Join(sysDir, iface, "device")
+	require.NoError(t, os.MkdirAll(deviceDir, 0755))
+	require.NoError(t, os.Symlink(
+		filepath.Join("../../../../firmware/devicetree/base", dtNodePath),
+		filepath.Join(deviceDir, "of_node"),
+	))
+}
+
+func TestGetBurnedInMAC_PrefersLabelMacDevice(t *testing.T) {
+	sysDir := t.TempDir()
+	dtBase := t.TempDir()
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dtBase, "aliases"), 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dtBase, "aliases", "label-mac-device"),
+		[]byte("/soc/ethernet@15100000/mac@1\x00"), 0644))
+
+	// eth0 is discovered first by directory order but is NOT the label MAC.
+	require.NoError(t, os.MkdirAll(filepath.Join(sysDir, "eth0"), 0755))
+	makeOfNodeLink(t, sysDir, "eth0", "/soc/ethernet@15100000/mac@0")
+	require.NoError(t, os.WriteFile(filepath.Join(sysDir, "eth0", "address"), []byte("94:83:c4:d4:ca:46\n"), 0644))
+
+	// eth1 matches the label-mac-device alias.
+	require.NoError(t, os.MkdirAll(filepath.Join(sysDir, "eth1"), 0755))
+	makeOfNodeLink(t, sysDir, "eth1", "/soc/ethernet@15100000/mac@1")
+	require.NoError(t, os.WriteFile(filepath.Join(sysDir, "eth1", "address"), []byte("94:83:c4:d4:ca:48\n"), 0644))
+
+	mac, err := getBurnedInMAC(sysDir, dtBase)
+	require.NoError(t, err)
+	assert.Equal(t, "94:83:c4:d4:ca:48", mac)
+}
+
+func TestGetBurnedInMAC_FallsBackWhenAliasAbsent(t *testing.T) {
+	sysDir := t.TempDir()
+	dtBase := t.TempDir() // no aliases directory at all
+
+	eth0Dir := filepath.Join(sysDir, "eth0")
+	require.NoError(t, os.MkdirAll(eth0Dir, 0755))
+	require.NoError(t, os.Symlink("/sys/devices/platform/eth0", filepath.Join(eth0Dir, "device")))
+	require.NoError(t, os.WriteFile(filepath.Join(eth0Dir, "address"), []byte("aa:bb:cc:dd:ee:ff\n"), 0644))
+
+	mac, err := getBurnedInMAC(sysDir, dtBase)
+	require.NoError(t, err)
+	assert.Equal(t, "aa:bb:cc:dd:ee:ff", mac)
+}
+
+func TestGetBurnedInMAC_FallsBackWhenNoInterfaceMatchesAlias(t *testing.T) {
+	sysDir := t.TempDir()
+	dtBase := t.TempDir()
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dtBase, "aliases"), 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dtBase, "aliases", "label-mac-device"),
+		[]byte("/soc/ethernet@15100000/mac@9\x00"), 0644)) // no interface has this node
+
+	eth0Dir := filepath.Join(sysDir, "eth0")
+	require.NoError(t, os.MkdirAll(eth0Dir, 0755))
+	makeOfNodeLink(t, sysDir, "eth0", "/soc/ethernet@15100000/mac@0")
+	require.NoError(t, os.WriteFile(filepath.Join(eth0Dir, "address"), []byte("aa:bb:cc:dd:ee:ff\n"), 0644))
+
+	mac, err := getBurnedInMAC(sysDir, dtBase)
+	require.NoError(t, err)
+	assert.Equal(t, "aa:bb:cc:dd:ee:ff", mac)
+}
+
 func TestGetFirstPhysicalMAC_MissingAddressFile(t *testing.T) {
 	sysDir := t.TempDir()
 
