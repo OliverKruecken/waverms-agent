@@ -38,9 +38,10 @@ func TestHandleUbusListen_StartsListenAndAcksOk(t *testing.T) {
 	if status := lastAckStatus(mqttMock); status != "ok" {
 		t.Errorf("status = %q, want ok", status)
 	}
-	waitForCondition(t, func() bool { return len(starter.StartCalls) == 1 })
-	if starter.StartCalls[0].EventType != "assoc" {
-		t.Errorf("StartCalls = %v, want exactly one call for %q", starter.StartCalls, "assoc")
+	waitForCondition(t, func() bool { return len(starter.StartCallsSnapshot()) == 1 })
+	calls := starter.StartCallsSnapshot()
+	if calls[0].EventType != "assoc" {
+		t.Errorf("StartCalls = %v, want exactly one call for %q", calls, "assoc")
 	}
 }
 
@@ -61,10 +62,10 @@ func TestHandleUbusListen_AlreadyListeningIsNoOp(t *testing.T) {
 	if status := lastAckStatus(mqttMock); status != "ok" {
 		t.Errorf("status = %q, want ok (idempotent no-op)", status)
 	}
-	waitForCondition(t, func() bool { return len(starter.StartCalls) == 1 })
+	waitForCondition(t, func() bool { return len(starter.StartCallsSnapshot()) == 1 })
 	time.Sleep(20 * time.Millisecond) // give a wrongly-started second goroutine a chance to show up
-	if len(starter.StartCalls) != 1 {
-		t.Errorf("expected exactly one Start call, got %d: %v", len(starter.StartCalls), starter.StartCalls)
+	if calls := starter.StartCallsSnapshot(); len(calls) != 1 {
+		t.Errorf("expected exactly one Start call, got %d: %v", len(calls), calls)
 	}
 }
 
@@ -78,8 +79,8 @@ func TestHandleUbusListen_InvalidEventRejectedWithoutStarting(t *testing.T) {
 	if status := lastAckStatus(mqttMock); status != "error" {
 		t.Errorf("status = %q, want error", status)
 	}
-	if len(starter.StartCalls) != 0 {
-		t.Errorf("expected no Start call for invalid input, got %v", starter.StartCalls)
+	if calls := starter.StartCallsSnapshot(); len(calls) != 0 {
+		t.Errorf("expected no Start call for invalid input, got %v", calls)
 	}
 }
 
@@ -89,7 +90,7 @@ func TestHandleUbusUnlisten_StopsListenAndProcess(t *testing.T) {
 	a := newUbusListenTestAgent(mqttMock, starter)
 
 	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
-	waitForCondition(t, func() bool { return len(starter.StartedProcesses) == 1 })
+	waitForCondition(t, func() bool { return len(starter.StartedProcessesSnapshot()) == 1 })
 
 	a.handleUbusUnlisten(Command{CmdID: "u1", Type: "ubus_unlisten", Payload: []byte(`{"event":"assoc"}`)})
 
@@ -104,7 +105,7 @@ func TestHandleUbusUnlisten_StopsListenAndProcess(t *testing.T) {
 	}
 	// Stop() is observed by runUbusListen's goroutine asynchronously (a select on the closed
 	// stop channel), so a synchronous read right after close(stop) races it — poll instead.
-	waitForCondition(t, func() bool { return starter.StartedProcesses[0].Stopped })
+	waitForCondition(t, func() bool { return starter.StartedProcessesSnapshot()[0].IsStopped() })
 }
 
 func TestHandleUbusUnlisten_NotListeningIsNoOpNotError(t *testing.T) {
@@ -124,8 +125,8 @@ func TestRunUbusListen_PublishesEachLineToUbusEventTopic(t *testing.T) {
 	a := newUbusListenTestAgent(mqttMock, starter)
 
 	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
-	waitForCondition(t, func() bool { return len(starter.StartedProcesses) == 1 })
-	proc := starter.StartedProcesses[0]
+	waitForCondition(t, func() bool { return len(starter.StartedProcessesSnapshot()) == 1 })
+	proc := starter.StartedProcessesSnapshot()[0]
 
 	proc.Push(`{ "assoc": {"address":"aa:bb:cc:dd:ee:01"} }`)
 
@@ -182,8 +183,8 @@ func TestRunUbusListen_FiltersOutNonMatchingEventTypes(t *testing.T) {
 	a := newUbusListenTestAgent(mqttMock, starter)
 
 	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
-	waitForCondition(t, func() bool { return len(starter.StartedProcesses) == 1 })
-	proc := starter.StartedProcesses[0]
+	waitForCondition(t, func() bool { return len(starter.StartedProcessesSnapshot()) == 1 })
+	proc := starter.StartedProcessesSnapshot()[0]
 
 	proc.Push(`{ "probe": {"address":"aa:bb:cc:dd:ee:99"} }`)
 	proc.Push(`{ "auth": {"address":"aa:bb:cc:dd:ee:98"} }`)
@@ -228,13 +229,13 @@ func TestRunUbusListen_RestartsAfterUnexpectedExit(t *testing.T) {
 	a := newUbusListenTestAgent(mqttMock, starter)
 
 	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
-	waitForCondition(t, func() bool { return len(starter.StartedProcesses) == 1 })
+	waitForCondition(t, func() bool { return len(starter.StartedProcessesSnapshot()) == 1 })
 
-	starter.StartedProcesses[0].SimulateExit(errors.New("ubusd restarted"))
+	starter.StartedProcessesSnapshot()[0].SimulateExit(errors.New("ubusd restarted"))
 
-	waitForCondition(t, func() bool { return len(starter.StartedProcesses) == 2 })
-	if starter.StartCalls[1].EventType != "assoc" {
-		t.Errorf("restart StartCalls[1] = %+v, want EventType assoc", starter.StartCalls[1])
+	waitForCondition(t, func() bool { return len(starter.StartedProcessesSnapshot()) == 2 })
+	if calls := starter.StartCallsSnapshot(); calls[1].EventType != "assoc" {
+		t.Errorf("restart StartCalls[1] = %+v, want EventType assoc", calls[1])
 	}
 
 	a.listensMu.Lock()
@@ -251,7 +252,7 @@ func TestRunUbusListen_SessionDisconnectTearsDownAndStopsProcess(t *testing.T) {
 	a.setSessionDisconnCh(disconnCh)
 
 	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
-	waitForCondition(t, func() bool { return len(starter.StartedProcesses) == 1 })
+	waitForCondition(t, func() bool { return len(starter.StartedProcessesSnapshot()) == 1 })
 
 	close(disconnCh)
 
@@ -261,7 +262,7 @@ func TestRunUbusListen_SessionDisconnectTearsDownAndStopsProcess(t *testing.T) {
 		_, listening := a.listens[makeListenKey("", "assoc")]
 		return !listening
 	})
-	if !starter.StartedProcesses[0].Stopped {
+	if !starter.StartedProcessesSnapshot()[0].IsStopped() {
 		t.Error("expected the subprocess to be stopped on session disconnect")
 	}
 }

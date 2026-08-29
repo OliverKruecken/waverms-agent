@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/OliverKruecken/waverms-agent/internal/uci"
@@ -187,10 +188,16 @@ func (p *realUbusListenProcess) Stop() {
 
 // MockUbusListenStarter is a call-recording UbusListenStarter test double —
 // mirrors MockMQTTClient's ability to simulate incoming messages/disconnects.
-// Tests drive a specific started process via StartedProcesses[i], pushing
-// synthetic lines onto it and closing it (with an injected exit error) to
-// simulate a crash.
+// Tests drive a specific started process via StartedProcessesSnapshot()[i],
+// pushing synthetic lines onto it and closing it (with an injected exit
+// error) to simulate a crash. Start() runs in the agent's own goroutine (the
+// handler dispatches it via `go`), so StartCalls/StartedProcesses are
+// mutex-guarded — tests must read them through the Snapshot methods rather
+// than the fields directly, or the race detector (correctly) flags a
+// concurrent unsynchronized access even when timing alone would happen to
+// avoid actually corrupting data.
 type MockUbusListenStarter struct {
+	mu               sync.Mutex
 	StartCalls       []UbusListenStartCall // (objectPrefix, eventType) per call, in order
 	StartErr         error
 	StartedProcesses []*MockUbusListenProcess
@@ -203,6 +210,8 @@ type UbusListenStartCall struct {
 }
 
 func (m *MockUbusListenStarter) Start(_ context.Context, objectPrefix, eventType string) (UbusListenProcess, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.StartCalls = append(m.StartCalls, UbusListenStartCall{ObjectPrefix: objectPrefix, EventType: eventType})
 	if m.StartErr != nil {
 		return nil, m.StartErr
@@ -212,12 +221,32 @@ func (m *MockUbusListenStarter) Start(_ context.Context, objectPrefix, eventType
 	return p, nil
 }
 
+// StartCallsSnapshot returns a copy of the calls recorded so far.
+func (m *MockUbusListenStarter) StartCallsSnapshot() []UbusListenStartCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]UbusListenStartCall, len(m.StartCalls))
+	copy(out, m.StartCalls)
+	return out
+}
+
+// StartedProcessesSnapshot returns a copy of the process pointers started so far.
+func (m *MockUbusListenStarter) StartedProcessesSnapshot() []*MockUbusListenProcess {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*MockUbusListenProcess, len(m.StartedProcesses))
+	copy(out, m.StartedProcesses)
+	return out
+}
+
 // MockUbusListenProcess is a synthetic UbusListenProcess driven by tests.
 type MockUbusListenProcess struct {
 	lines   chan string
 	done    chan struct{}
 	exitErr error
-	Stopped bool
+
+	mu      sync.Mutex
+	stopped bool
 }
 
 func (p *MockUbusListenProcess) Lines() <-chan string { return p.lines }
@@ -228,8 +257,19 @@ func (p *MockUbusListenProcess) Wait() error {
 }
 
 func (p *MockUbusListenProcess) Stop() {
-	p.Stopped = true
+	p.mu.Lock()
+	p.stopped = true
+	p.mu.Unlock()
 	p.SimulateExit(nil)
+}
+
+// IsStopped reports whether Stop() has been called. Stop() runs in the
+// agent's own goroutine (runUbusListen's cleanup), so tests must read this
+// through the method rather than a plain field.
+func (p *MockUbusListenProcess) IsStopped() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stopped
 }
 
 // Push feeds one synthetic ubus JSON line, as if `ubus subscribe` had received it.

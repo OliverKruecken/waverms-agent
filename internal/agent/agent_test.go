@@ -715,12 +715,19 @@ func TestRun_BootstrapForcesCleanStartOnNextConnect(t *testing.T) {
 
 	// Wait for bootstrap/register, then reply on the tmp_id it actually generated
 	// (agent.go never sets a fixed TmpID, so bootstrap.Run() picks a random uuid).
-	require.Eventually(t, func() bool { return len(mock.Published) > 0 }, time.Second, time.Millisecond)
+	// a.Run(ctx) is still running concurrently at this point, so reads must go
+	// through the mock's mutex via PublishedSnapshot rather than touching
+	// mock.Published directly.
+	var published []mqttclient.PublishedMsg
+	require.Eventually(t, func() bool {
+		published = mock.PublishedSnapshot()
+		return len(published) > 0
+	}, time.Second, time.Millisecond)
 	var req struct {
 		TmpID string `json:"tmp_id"`
 	}
-	require.NoError(t, json.Unmarshal(mock.Published[0].Payload, &req))
-	require.Equal(t, "bootstrap/register", mock.Published[0].Topic)
+	require.NoError(t, json.Unmarshal(published[0].Payload, &req))
+	require.Equal(t, "bootstrap/register", published[0].Topic)
 
 	resp := struct {
 		DeviceID   string `json:"device_id"`
