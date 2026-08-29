@@ -4,6 +4,7 @@ package uci
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -11,20 +12,44 @@ import (
 	"time"
 )
 
-// UCIRunner abstracts the uci CLI so that business logic can be tested
-// without a real OpenWrt device.
+// UCIRunner abstracts UCI access so that business logic can be tested without
+// a real OpenWrt device. Reads and most writes go through rpcd's `uci` ubus
+// object (JSON in, JSON out — see RealUCIRunner) rather than shelling out to
+// the `uci` CLI and parsing its text output; RetypeExisting is the one
+// exception, kept on the CLI (see its doc comment).
 type UCIRunner interface {
-	Get(pkg, section, option string) (string, error)
-	Set(pkg, section, option, value string) error
-	SetType(pkg, section, sectionType string) error
-	Add(pkg, sectionType string) (string, error)
-	AddList(pkg, section, option, value string) error
-	Delete(pkg, section string) error
-	DeleteOption(pkg, section, option string) error
+	// GetSections fetches every section currently in pkg from the device, in
+	// on-device declaration order. Returns a non-nil error if the package
+	// doesn't exist yet or the ubus call otherwise fails — callers with a
+	// "doesn't exist yet means empty" contract have historically treated any
+	// error here as "no sections."
+	GetSections(pkg string) ([]Section, error)
+	// Add creates a new section of sectionType in pkg. If name is non-empty
+	// the section is created with that name (idempotent-creation upsert
+	// semantics belong to the caller, which should only call Add when it has
+	// already established via GetSections that the name doesn't exist yet);
+	// if name is empty an anonymous section is created and its generated id
+	// is returned.
+	Add(pkg, sectionType, name string) (id string, err error)
+	// SetValues batch-sets every option in values on an existing section in
+	// one call. A []string value sets a UCI list option, replacing its
+	// entire prior contents; any other value is set as a scalar.
+	SetValues(pkg, sectionID string, values map[string]interface{}) error
+	// DeleteOptions removes the named options from an existing section,
+	// leaving the section and its other options intact.
+	DeleteOptions(pkg, sectionID string, options []string) error
+	// Delete removes an entire section.
+	Delete(pkg, sectionID string) error
 	Commit(pkg string) error
 	Revert(pkg string) error
-	Export(pkg string) (string, error)
-	Show(pkg string) (string, error)
+	// RetypeExisting changes an already-existing section's type in place
+	// (`uci set pkg.section=type`). rpcd's uci `set` method has no parameter
+	// to change an existing section's type (only `add` sets type, and only
+	// at creation) — this is the one write operation this package could not
+	// confirm a ubus equivalent for, so it stays on the CLI. It's only ever
+	// needed for the rare case of a named section that already exists under
+	// the wrong type; the common create/update paths never call it.
+	RetypeExisting(pkg, sectionID, sectionType string) error
 	// ExecRaw runs the uci CLI with arbitrary args (for ad-hoc commands from server).
 	ExecRaw(args ...string) (string, error)
 	// ExecCmd runs an arbitrary executable directly (not via uci), e.g. an init script.
@@ -37,7 +62,8 @@ type UCIRunner interface {
 	ExecShell(command string, timeout time.Duration) (output string, exitCode int, err error)
 }
 
-// RealUCIRunner calls the uci CLI via os/exec.
+// RealUCIRunner calls the uci CLI (RetypeExisting/ExecRaw/ExecCmd/ExecShell) and
+// rpcd's uci ubus object (everything else, via `ubus call uci <method> <json>`).
 type RealUCIRunner struct{}
 
 // uciTimeout is the maximum time a single uci CLI call is allowed to run.
@@ -55,55 +81,78 @@ func run(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func (r *RealUCIRunner) Get(pkg, section, option string) (string, error) {
-	return run("get", fmt.Sprintf("%s.%s.%s", pkg, section, option))
+// ubusUCI calls `ubus call uci <method> <json-encoded params>` and returns its raw stdout.
+func (r *RealUCIRunner) ubusUCI(method string, params interface{}) (string, error) {
+	body, err := json.Marshal(params)
+	if err != nil {
+		return "", fmt.Errorf("marshal uci %s params: %w", method, err)
+	}
+	return r.ExecCmd("ubus", "call", "uci", method, string(body))
 }
 
-func (r *RealUCIRunner) Set(pkg, section, option, value string) error {
-	_, err := run("set", fmt.Sprintf("%s.%s.%s=%s", pkg, section, option, value))
+func (r *RealUCIRunner) GetSections(pkg string) ([]Section, error) {
+	out, err := r.ubusUCI("get", map[string]string{"config": pkg})
+	if err != nil {
+		return nil, err
+	}
+	return decodeUbusUCIGet(out)
+}
+
+func (r *RealUCIRunner) Add(pkg, sectionType, name string) (string, error) {
+	params := map[string]interface{}{"config": pkg, "type": sectionType}
+	if name != "" {
+		params["name"] = name
+	}
+	out, err := r.ubusUCI("add", params)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Section string `json:"section"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return "", fmt.Errorf("decode uci add response: %w", err)
+	}
+	if resp.Section == "" {
+		return "", fmt.Errorf("uci add %s %s: no section id in response", pkg, sectionType)
+	}
+	return resp.Section, nil
+}
+
+func (r *RealUCIRunner) SetValues(pkg, sectionID string, values map[string]interface{}) error {
+	if len(values) == 0 {
+		return nil
+	}
+	_, err := r.ubusUCI("set", map[string]interface{}{"config": pkg, "section": sectionID, "values": values})
 	return err
 }
 
-func (r *RealUCIRunner) SetType(pkg, section, sectionType string) error {
-	_, err := run("set", fmt.Sprintf("%s.%s=%s", pkg, section, sectionType))
+func (r *RealUCIRunner) DeleteOptions(pkg, sectionID string, options []string) error {
+	if len(options) == 0 {
+		return nil
+	}
+	_, err := r.ubusUCI("delete", map[string]interface{}{"config": pkg, "section": sectionID, "options": options})
 	return err
 }
 
-func (r *RealUCIRunner) Add(pkg, sectionType string) (string, error) {
-	return run("add", pkg, sectionType)
-}
-
-func (r *RealUCIRunner) AddList(pkg, section, option, value string) error {
-	_, err := run("add_list", fmt.Sprintf("%s.%s.%s=%s", pkg, section, option, value))
-	return err
-}
-
-func (r *RealUCIRunner) Delete(pkg, section string) error {
-	_, err := run("delete", fmt.Sprintf("%s.%s", pkg, section))
-	return err
-}
-
-func (r *RealUCIRunner) DeleteOption(pkg, section, option string) error {
-	_, err := run("delete", fmt.Sprintf("%s.%s.%s", pkg, section, option))
+func (r *RealUCIRunner) Delete(pkg, sectionID string) error {
+	_, err := r.ubusUCI("delete", map[string]interface{}{"config": pkg, "section": sectionID})
 	return err
 }
 
 func (r *RealUCIRunner) Commit(pkg string) error {
-	_, err := run("commit", pkg)
+	_, err := r.ubusUCI("commit", map[string]string{"config": pkg})
 	return err
 }
 
 func (r *RealUCIRunner) Revert(pkg string) error {
-	_, err := run("revert", pkg)
+	_, err := r.ubusUCI("revert", map[string]string{"config": pkg})
 	return err
 }
 
-func (r *RealUCIRunner) Export(pkg string) (string, error) {
-	return run("export", pkg)
-}
-
-func (r *RealUCIRunner) Show(pkg string) (string, error) {
-	return run("show", pkg)
+func (r *RealUCIRunner) RetypeExisting(pkg, sectionID, sectionType string) error {
+	_, err := run("set", fmt.Sprintf("%s.%s=%s", pkg, sectionID, sectionType))
+	return err
 }
 
 func (r *RealUCIRunner) ExecRaw(args ...string) (string, error) {
@@ -145,12 +194,33 @@ func (r *RealUCIRunner) ExecShell(command string, timeout time.Duration) (string
 // MockUCIRunner records all calls for test assertions.
 // Inject errors via the Errors map keyed by the command string.
 // Inject output via the Results map keyed by the command string.
+// Inject GetSections' return value via Sections, keyed by package name.
 // Inject a non-zero ExecShell exit code via the ExitCodes map keyed by "shell <command>".
+// SetValues/Add calls carrying a map or requiring exact value assertions are also recorded,
+// in order, into SetValuesCalls/AddCalls — a stringified map has nondeterministic key order,
+// so those two are asserted on directly rather than via the Calls string log.
 type MockUCIRunner struct {
-	Calls     []string
-	Errors    map[string]error
-	Results   map[string]string
-	ExitCodes map[string]int
+	Calls          []string
+	Errors         map[string]error
+	Results        map[string]string
+	ExitCodes      map[string]int
+	Sections       map[string][]Section
+	SetValuesCalls []SetValuesCall
+	AddCalls       []AddCall
+
+	addSeq int
+}
+
+// SetValuesCall records one MockUCIRunner.SetValues invocation.
+type SetValuesCall struct {
+	Pkg     string
+	Section string
+	Values  map[string]interface{}
+}
+
+// AddCall records one MockUCIRunner.Add invocation.
+type AddCall struct {
+	Pkg, SectionType, Name string
 }
 
 func (m *MockUCIRunner) err(cmd string) error {
@@ -164,44 +234,52 @@ func (m *MockUCIRunner) record(cmd string) {
 	m.Calls = append(m.Calls, cmd)
 }
 
-func (m *MockUCIRunner) Get(pkg, section, option string) (string, error) {
-	cmd := fmt.Sprintf("get %s.%s.%s", pkg, section, option)
+func (m *MockUCIRunner) GetSections(pkg string) ([]Section, error) {
+	cmd := fmt.Sprintf("sections %s", pkg)
 	m.record(cmd)
-	return "", m.err(cmd)
+	if err := m.err(cmd); err != nil {
+		return nil, err
+	}
+	if m.Sections != nil {
+		return m.Sections[pkg], nil
+	}
+	return nil, nil
 }
 
-func (m *MockUCIRunner) Set(pkg, section, option, value string) error {
-	cmd := fmt.Sprintf("set %s.%s.%s=%s", pkg, section, option, value)
+func (m *MockUCIRunner) Add(pkg, sectionType, name string) (string, error) {
+	var cmd string
+	if name != "" {
+		cmd = fmt.Sprintf("add %s %s %s", pkg, sectionType, name)
+	} else {
+		cmd = fmt.Sprintf("add %s %s", pkg, sectionType)
+	}
+	m.record(cmd)
+	m.AddCalls = append(m.AddCalls, AddCall{Pkg: pkg, SectionType: sectionType, Name: name})
+	if err := m.err(cmd); err != nil {
+		return "", err
+	}
+	if name != "" {
+		return name, nil
+	}
+	m.addSeq++
+	return fmt.Sprintf("cfg%06x", m.addSeq), nil
+}
+
+func (m *MockUCIRunner) SetValues(pkg, sectionID string, values map[string]interface{}) error {
+	cmd := fmt.Sprintf("setvalues %s.%s", pkg, sectionID)
+	m.record(cmd)
+	m.SetValuesCalls = append(m.SetValuesCalls, SetValuesCall{Pkg: pkg, Section: sectionID, Values: values})
+	return m.err(cmd)
+}
+
+func (m *MockUCIRunner) DeleteOptions(pkg, sectionID string, options []string) error {
+	cmd := fmt.Sprintf("deleteoptions %s.%s %v", pkg, sectionID, options)
 	m.record(cmd)
 	return m.err(cmd)
 }
 
-func (m *MockUCIRunner) SetType(pkg, section, sectionType string) error {
-	cmd := fmt.Sprintf("set-type %s.%s=%s", pkg, section, sectionType)
-	m.record(cmd)
-	return m.err(cmd)
-}
-
-func (m *MockUCIRunner) Add(pkg, sectionType string) (string, error) {
-	cmd := fmt.Sprintf("add %s %s", pkg, sectionType)
-	m.record(cmd)
-	return fmt.Sprintf("cfg%06x", len(m.Calls)), m.err(cmd)
-}
-
-func (m *MockUCIRunner) AddList(pkg, section, option, value string) error {
-	cmd := fmt.Sprintf("add_list %s.%s.%s=%s", pkg, section, option, value)
-	m.record(cmd)
-	return m.err(cmd)
-}
-
-func (m *MockUCIRunner) Delete(pkg, section string) error {
-	cmd := fmt.Sprintf("delete %s.%s", pkg, section)
-	m.record(cmd)
-	return m.err(cmd)
-}
-
-func (m *MockUCIRunner) DeleteOption(pkg, section, option string) error {
-	cmd := fmt.Sprintf("delete-option %s.%s.%s", pkg, section, option)
+func (m *MockUCIRunner) Delete(pkg, sectionID string) error {
+	cmd := fmt.Sprintf("delete %s.%s", pkg, sectionID)
 	m.record(cmd)
 	return m.err(cmd)
 }
@@ -218,26 +296,10 @@ func (m *MockUCIRunner) Revert(pkg string) error {
 	return m.err(cmd)
 }
 
-func (m *MockUCIRunner) Export(pkg string) (string, error) {
-	cmd := fmt.Sprintf("export %s", pkg)
+func (m *MockUCIRunner) RetypeExisting(pkg, sectionID, sectionType string) error {
+	cmd := fmt.Sprintf("set-type %s.%s=%s", pkg, sectionID, sectionType)
 	m.record(cmd)
-	if m.Results != nil {
-		if out, ok := m.Results[cmd]; ok {
-			return out, m.err(cmd)
-		}
-	}
-	return "", m.err(cmd)
-}
-
-func (m *MockUCIRunner) Show(pkg string) (string, error) {
-	cmd := fmt.Sprintf("show %s", pkg)
-	m.record(cmd)
-	if m.Results != nil {
-		if out, ok := m.Results[cmd]; ok {
-			return out, m.err(cmd)
-		}
-	}
-	return "", m.err(cmd)
+	return m.err(cmd)
 }
 
 func (m *MockUCIRunner) ExecRaw(args ...string) (string, error) {

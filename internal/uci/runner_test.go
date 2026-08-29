@@ -6,13 +6,77 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestMockUCIRunner_Set(t *testing.T) {
+func TestMockUCIRunner_GetSections(t *testing.T) {
+	m := &MockUCIRunner{
+		Sections: map[string][]Section{
+			"network": {{ID: "lan", Type: "interface", Name: "lan", Options: map[string]interface{}{"proto": "static"}}},
+		},
+	}
+	sections, err := m.GetSections("network")
+	require.NoError(t, err)
+	require.Len(t, sections, 1)
+	assert.Equal(t, "lan", sections[0].ID)
+	assert.Contains(t, m.Calls, "sections network")
+}
+
+func TestMockUCIRunner_GetSections_UnknownPackageReturnsEmpty(t *testing.T) {
 	m := &MockUCIRunner{}
-	err := m.Set("network", "wan", "proto", "dhcp")
+	sections, err := m.GetSections("network")
+	require.NoError(t, err)
+	assert.Empty(t, sections)
+}
+
+func TestMockUCIRunner_GetSections_ErrorInjection(t *testing.T) {
+	injected := errors.New("not found")
+	m := &MockUCIRunner{
+		Errors: map[string]error{"sections network": injected},
+	}
+	_, err := m.GetSections("network")
+	assert.ErrorIs(t, err, injected)
+}
+
+func TestMockUCIRunner_Add_Named(t *testing.T) {
+	m := &MockUCIRunner{}
+	id, err := m.Add("network", "interface", "lan")
+	require.NoError(t, err)
+	assert.Equal(t, "lan", id)
+	assert.Contains(t, m.Calls, "add network interface lan")
+	require.Len(t, m.AddCalls, 1)
+	assert.Equal(t, AddCall{Pkg: "network", SectionType: "interface", Name: "lan"}, m.AddCalls[0])
+}
+
+func TestMockUCIRunner_Add_Anonymous(t *testing.T) {
+	m := &MockUCIRunner{}
+	id, err := m.Add("network", "rule", "")
+	require.NoError(t, err)
+	assert.NotEmpty(t, id)
+	assert.Contains(t, m.Calls, "add network rule")
+}
+
+func TestMockUCIRunner_SetValues(t *testing.T) {
+	m := &MockUCIRunner{}
+	err := m.SetValues("network", "wan", map[string]interface{}{"proto": "dhcp"})
 	assert.NoError(t, err)
-	assert.Contains(t, m.Calls, "set network.wan.proto=dhcp")
+	assert.Contains(t, m.Calls, "setvalues network.wan")
+	require.Len(t, m.SetValuesCalls, 1)
+	assert.Equal(t, "dhcp", m.SetValuesCalls[0].Values["proto"])
+}
+
+func TestMockUCIRunner_DeleteOptions(t *testing.T) {
+	m := &MockUCIRunner{}
+	err := m.DeleteOptions("network", "wan", []string{"proto", "ipaddr"})
+	assert.NoError(t, err)
+	assert.Contains(t, m.Calls, "deleteoptions network.wan [proto ipaddr]")
+}
+
+func TestMockUCIRunner_Delete(t *testing.T) {
+	m := &MockUCIRunner{}
+	err := m.Delete("network", "wan")
+	assert.NoError(t, err)
+	assert.Contains(t, m.Calls, "delete network.wan")
 }
 
 func TestMockUCIRunner_Commit(t *testing.T) {
@@ -40,40 +104,11 @@ func TestMockUCIRunner_ErrorInjection(t *testing.T) {
 	assert.ErrorIs(t, err, injected)
 }
 
-func TestMockUCIRunner_Add(t *testing.T) {
+func TestMockUCIRunner_RetypeExisting(t *testing.T) {
 	m := &MockUCIRunner{}
-	ref, err := m.Add("network", "rule")
-	assert.NoError(t, err)
-	assert.NotEmpty(t, ref)
-	assert.Contains(t, m.Calls, "add network rule")
-}
-
-func TestMockUCIRunner_AddList(t *testing.T) {
-	m := &MockUCIRunner{}
-	err := m.AddList("network", "lan", "dns", "8.8.8.8")
-	assert.NoError(t, err)
-	assert.Contains(t, m.Calls, "add_list network.lan.dns=8.8.8.8")
-}
-
-func TestMockUCIRunner_SetType(t *testing.T) {
-	m := &MockUCIRunner{}
-	err := m.SetType("network", "wan", "interface")
+	err := m.RetypeExisting("network", "wan", "interface")
 	assert.NoError(t, err)
 	assert.Contains(t, m.Calls, "set-type network.wan=interface")
-}
-
-func TestMockUCIRunner_Delete(t *testing.T) {
-	m := &MockUCIRunner{}
-	err := m.Delete("network", "wan")
-	assert.NoError(t, err)
-	assert.Contains(t, m.Calls, "delete network.wan")
-}
-
-func TestMockUCIRunner_DeleteOption(t *testing.T) {
-	m := &MockUCIRunner{}
-	err := m.DeleteOption("network", "wan", "proto")
-	assert.NoError(t, err)
-	assert.Contains(t, m.Calls, "delete-option network.wan.proto")
 }
 
 func TestMockUCIRunner_ExecRaw(t *testing.T) {
@@ -96,14 +131,12 @@ func TestMockUCIRunner_ExecRaw_ErrorInjection(t *testing.T) {
 
 func TestMockUCIRunner_RecordsMultipleCalls(t *testing.T) {
 	m := &MockUCIRunner{}
-	_ = m.Set("network", "wan", "proto", "dhcp")
-	_ = m.Set("network", "wan", "ipaddr", "192.168.1.1")
+	_ = m.SetValues("network", "wan", map[string]interface{}{"proto": "dhcp"})
 	_ = m.Commit("network")
 
-	assert.Len(t, m.Calls, 3)
-	assert.Equal(t, "set network.wan.proto=dhcp", m.Calls[0])
-	assert.Equal(t, "set network.wan.ipaddr=192.168.1.1", m.Calls[1])
-	assert.Equal(t, "commit network", m.Calls[2])
+	assert.Len(t, m.Calls, 2)
+	assert.Equal(t, "setvalues network.wan", m.Calls[0])
+	assert.Equal(t, "commit network", m.Calls[1])
 }
 
 func TestMockUCIRunner_ExecShell(t *testing.T) {

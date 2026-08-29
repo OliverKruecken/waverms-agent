@@ -20,20 +20,32 @@ const wirelessMergeConfig = `{
   }
 }`
 
-func TestApply_NamedSection_SetsTypeAndOptions(t *testing.T) {
+// setValuesFor finds the SetValuesCall for pkg.section, if any.
+func setValuesFor(mock *uci.MockUCIRunner, pkg, section string) (map[string]interface{}, bool) {
+	for _, c := range mock.SetValuesCalls {
+		if c.Pkg == pkg && c.Section == section {
+			return c.Values, true
+		}
+	}
+	return nil, false
+}
+
+func TestApply_NamedSection_AddsAndSetsValues(t *testing.T) {
 	mock := &uci.MockUCIRunner{}
 	a := apply.New(mock)
 
 	_, err := a.Apply(json.RawMessage(wirelessMergeConfig))
 	require.NoError(t, err)
 
-	assert.Contains(t, mock.Calls, "set-type wireless.default_radio0=wifi-iface")
-	assert.Contains(t, mock.Calls, "set wireless.default_radio0.ssid=MyNetwork")
-	assert.Contains(t, mock.Calls, "set wireless.default_radio0.encryption=psk2")
+	assert.Contains(t, mock.Calls, "add wireless wifi-iface default_radio0")
+	values, ok := setValuesFor(mock, "wireless", "default_radio0")
+	require.True(t, ok, "expected a SetValues call for wireless.default_radio0")
+	assert.Equal(t, "MyNetwork", values["ssid"])
+	assert.Equal(t, "psk2", values["encryption"])
 	assert.Contains(t, mock.Calls, "commit wireless")
 }
 
-func TestApply_ListOption_DeletesThenAdds(t *testing.T) {
+func TestApply_ListOption_SetsWholeListInOneCall(t *testing.T) {
 	mock := &uci.MockUCIRunner{}
 	a := apply.New(mock)
 
@@ -48,17 +60,20 @@ func TestApply_ListOption_DeletesThenAdds(t *testing.T) {
 	_, err := a.Apply(json.RawMessage(cfg))
 	require.NoError(t, err)
 
-	assert.Contains(t, mock.Calls, "delete-option network.lan.dns")
-	assert.Contains(t, mock.Calls, "add_list network.lan.dns=8.8.8.8")
-	assert.Contains(t, mock.Calls, "add_list network.lan.dns=8.8.4.4")
+	values, ok := setValuesFor(mock, "network", "lan")
+	require.True(t, ok)
+	assert.Equal(t, []string{"8.8.8.8", "8.8.4.4"}, values["dns"])
 	assert.Contains(t, mock.Calls, "commit network")
 }
 
 func TestApply_ReplaceMode_DeletesUnwantedSections(t *testing.T) {
 	mock := &uci.MockUCIRunner{
-		Results: map[string]string{
+		Sections: map[string][]uci.Section{
 			// extra_iface is in current config but absent from desired config.
-			"show wireless": "wireless.default_radio0=wifi-iface\nwireless.extra_iface=wifi-iface\n",
+			"wireless": {
+				{ID: "default_radio0", Type: "wifi-iface", Name: "default_radio0"},
+				{ID: "extra_iface", Type: "wifi-iface", Name: "extra_iface"},
+			},
 		},
 	}
 	a := apply.New(mock)
@@ -76,13 +91,15 @@ func TestApply_ReplaceMode_DeletesUnwantedSections(t *testing.T) {
 
 	assert.Contains(t, mock.Calls, "delete wireless.extra_iface")
 	assert.NotContains(t, mock.Calls, "delete wireless.default_radio0")
-	assert.Contains(t, mock.Calls, "set wireless.default_radio0.ssid=NewSSID")
+	values, ok := setValuesFor(mock, "wireless", "default_radio0")
+	require.True(t, ok)
+	assert.Equal(t, "NewSSID", values["ssid"])
 }
 
 func TestApply_ReplaceMode_KeepsDesiredNamedSection(t *testing.T) {
 	mock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"show wireless": "wireless.default_radio0=wifi-iface\n",
+		Sections: map[string][]uci.Section{
+			"wireless": {{ID: "default_radio0", Type: "wifi-iface", Name: "default_radio0"}},
 		},
 	}
 	a := apply.New(mock)
@@ -99,7 +116,9 @@ func TestApply_ReplaceMode_KeepsDesiredNamedSection(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotContains(t, mock.Calls, "delete wireless.default_radio0")
-	assert.Contains(t, mock.Calls, "set wireless.default_radio0.ssid=MySSID")
+	values, ok := setValuesFor(mock, "wireless", "default_radio0")
+	require.True(t, ok)
+	assert.Equal(t, "MySSID", values["ssid"])
 }
 
 func TestApply_AnonymousSection_UsesAdd(t *testing.T) {
@@ -117,22 +136,15 @@ func TestApply_AnonymousSection_UsesAdd(t *testing.T) {
 	_, err := a.Apply(json.RawMessage(cfg))
 	require.NoError(t, err)
 
-	// Anonymous section: should call Add, not SetType.
-	found := false
-	for _, c := range mock.Calls {
-		if c == "add firewall rule" {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected 'add firewall rule' call for anonymous section")
+	// Anonymous section: should call Add with no name, not RetypeExisting.
+	assert.Contains(t, mock.Calls, "add firewall rule")
 	assert.Contains(t, mock.Calls, "commit firewall")
 }
 
 func TestApply_StagingError_RevertsAllStagedPackages(t *testing.T) {
 	mock := &uci.MockUCIRunner{
 		Errors: map[string]error{
-			"set wireless.default_radio0.ssid=MyNetwork": assert.AnError,
+			"setvalues wireless.default_radio0": assert.AnError,
 		},
 	}
 	a := apply.New(mock)
@@ -298,8 +310,11 @@ func TestApply_EmptyConfig_ReturnsNoPackages(t *testing.T) {
 func TestApply_MergeMode_RemovesStaleOption(t *testing.T) {
 	// Device has "disabled='1'" on wifinet0 but desired config does not include it.
 	mock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"show wireless": "wireless.wifinet0=wifi-iface\nwireless.wifinet0.mode='mesh'\nwireless.wifinet0.disabled='1'\n",
+		Sections: map[string][]uci.Section{
+			"wireless": {{
+				ID: "wifinet0", Type: "wifi-iface", Name: "wifinet0",
+				Options: map[string]interface{}{"mode": "mesh", "disabled": "1"},
+			}},
 		},
 	}
 	a := apply.New(mock)
@@ -315,10 +330,13 @@ func TestApply_MergeMode_RemovesStaleOption(t *testing.T) {
 	_, err := a.Apply(json.RawMessage(cfg))
 	require.NoError(t, err)
 
-	assert.Contains(t, mock.Calls, "delete-option wireless.wifinet0.disabled",
+	assert.Contains(t, mock.Calls, "deleteoptions wireless.wifinet0 [disabled]",
 		"stale option 'disabled' should be removed")
-	assert.NotContains(t, mock.Calls, "delete-option wireless.wifinet0.mode",
-		"desired option 'mode' must not be deleted")
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "deleteoptions") {
+			assert.NotContains(t, c, "mode", "desired option 'mode' must not be deleted")
+		}
+	}
 }
 
 func TestApply_AnonymousSection_NewSection_SkipsStaleClean(t *testing.T) {
@@ -339,22 +357,22 @@ func TestApply_AnonymousSection_NewSection_SkipsStaleClean(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, c := range mock.Calls {
-		assert.NotContains(t, c, "delete-option",
+		assert.NotContains(t, c, "deleteoptions",
 			"cleanStaleOptions must not run for newly-created anonymous sections")
 	}
 }
 
 func TestApply_AnonymousSection_ReuseExisting_CleansStaleOptions(t *testing.T) {
-	// Device has @dnsmasq[0] with "authoritative" and "boguspriv" set.
-	// Desired config only specifies "authoritative". "boguspriv" must be removed
-	// so the deploy resolves drift instead of leaving extra options on the device.
+	// Device has @dnsmasq[0] (real id cfg-dnsmasq0) with "authoritative" and
+	// "boguspriv" set. Desired config only specifies "authoritative"; "boguspriv"
+	// must be removed so the deploy resolves drift instead of leaving extra
+	// options on the device.
 	mock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"show dhcp": strings.Join([]string{
-				"dhcp.@dnsmasq[0]=dnsmasq",
-				"dhcp.@dnsmasq[0].authoritative='1'",
-				"dhcp.@dnsmasq[0].boguspriv='1'",
-			}, "\n"),
+		Sections: map[string][]uci.Section{
+			"dhcp": {{
+				ID: "cfg-dnsmasq0", Type: "dnsmasq", Anonymous: true,
+				Options: map[string]interface{}{"authoritative": "1", "boguspriv": "1"},
+			}},
 		},
 	}
 	a := apply.New(mock)
@@ -370,19 +388,20 @@ func TestApply_AnonymousSection_ReuseExisting_CleansStaleOptions(t *testing.T) {
 	_, err := a.Apply(json.RawMessage(cfg))
 	require.NoError(t, err)
 
-	assert.Contains(t, mock.Calls, "delete-option dhcp.@dnsmasq[0].boguspriv",
+	assert.Contains(t, mock.Calls, "deleteoptions dhcp.cfg-dnsmasq0 [boguspriv]",
 		"stale option 'boguspriv' should be removed from reused anonymous section")
-	assert.NotContains(t, mock.Calls, "delete-option dhcp.@dnsmasq[0].authoritative",
-		"desired option 'authoritative' must not be deleted")
 	assert.Contains(t, mock.Calls, "commit dhcp")
 }
 
 func TestApply_AnonymousSection_MergeReuseExisting(t *testing.T) {
-	// Device already has @system[0]; applying desired config must update it in
-	// place (no Add call, no duplicate section).
+	// Device already has an anonymous @system[0] (real id cfg-system0); applying
+	// desired config must update it in place (no Add call, no duplicate section).
 	mock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"show system": "system.@system[0]=system\nsystem.@system[0].hostname=OpenWrt\nsystem.@system[0].timezone=GMT0\n",
+		Sections: map[string][]uci.Section{
+			"system": {{
+				ID: "cfg-system0", Type: "system", Anonymous: true,
+				Options: map[string]interface{}{"hostname": "OpenWrt", "timezone": "GMT0"},
+			}},
 		},
 	}
 	a := apply.New(mock)
@@ -398,12 +417,12 @@ func TestApply_AnonymousSection_MergeReuseExisting(t *testing.T) {
 	_, err := a.Apply(json.RawMessage(cfg))
 	require.NoError(t, err)
 
-	// Must reuse @system[0], not add a new section.
-	for _, c := range mock.Calls {
-		assert.NotEqual(t, "add system system", c,
-			"Add must not be called when an existing anonymous section can be reused")
-	}
-	assert.Contains(t, mock.Calls, "set system.@system[0].hostname=wrt-test")
+	// Must reuse cfg-system0, not add a new section.
+	assert.NotContains(t, mock.Calls, "add system system",
+		"Add must not be called when an existing anonymous section can be reused")
+	values, ok := setValuesFor(mock, "system", "cfg-system0")
+	require.True(t, ok)
+	assert.Equal(t, "wrt-test", values["hostname"])
 	assert.Contains(t, mock.Calls, "commit system")
 }
 
@@ -434,14 +453,12 @@ func TestApply_ReplaceMode_DeletesEntireUnlistedSectionType(t *testing.T) {
 	// say ".mode":"replace" means "wipe + rewrite" the whole package; the fix makes
 	// replace mode delete every existing section of ANY type not kept by the payload.
 	mock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"show firewall": strings.Join([]string{
-				"firewall.@defaults[0]=defaults",
-				"firewall.@rule[0]=rule",
-				"firewall.@rule[0].name='Allow-Ping'",
-				"firewall.@zone[0]=zone",
-				"firewall.@zone[0].name='lan'",
-			}, "\n"),
+		Sections: map[string][]uci.Section{
+			"firewall": {
+				{ID: "cfg-defaults0", Type: "defaults", Anonymous: true},
+				{ID: "cfg-rule0", Type: "rule", Anonymous: true, Options: map[string]interface{}{"name": "Allow-Ping"}},
+				{ID: "cfg-zone0", Type: "zone", Anonymous: true, Options: map[string]interface{}{"name": "lan"}},
+			},
 		},
 	}
 	a := apply.New(mock)
@@ -455,11 +472,11 @@ func TestApply_ReplaceMode_DeletesEntireUnlistedSectionType(t *testing.T) {
 	_, err := a.Apply(json.RawMessage(cfg))
 	require.NoError(t, err)
 
-	assert.Contains(t, mock.Calls, "delete firewall.@rule[0]",
+	assert.Contains(t, mock.Calls, "delete firewall.cfg-rule0",
 		"rule section must be deleted even though the template never mentions the rule type")
-	assert.Contains(t, mock.Calls, "delete firewall.@zone[0]",
+	assert.Contains(t, mock.Calls, "delete firewall.cfg-zone0",
 		"zone section must be deleted even though the template never mentions the zone type")
-	assert.Contains(t, mock.Calls, "delete firewall.@defaults[0]",
+	assert.Contains(t, mock.Calls, "delete firewall.cfg-defaults0",
 		"old anonymous defaults section must be deleted before the new one is added")
 	assert.Contains(t, mock.Calls, "add firewall defaults")
 }
@@ -468,12 +485,11 @@ func TestApply_ReplaceMode_UnlistedTypeKeepsNamedSectionFromListedType(t *testin
 	// A named section kept by one listed section type must survive the whole-package
 	// sweep even though it's discovered via a different existingSectionTypes() entry.
 	mock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"show firewall": strings.Join([]string{
-				"firewall.lan=zone",
-				"firewall.@rule[0]=rule",
-				"firewall.@rule[0].name='Allow-Ping'",
-			}, "\n"),
+		Sections: map[string][]uci.Section{
+			"firewall": {
+				{ID: "lan", Type: "zone", Name: "lan"},
+				{ID: "cfg-rule0", Type: "rule", Anonymous: true, Options: map[string]interface{}{"name": "Allow-Ping"}},
+			},
 		},
 	}
 	a := apply.New(mock)
@@ -489,26 +505,26 @@ func TestApply_ReplaceMode_UnlistedTypeKeepsNamedSectionFromListedType(t *testin
 
 	assert.NotContains(t, mock.Calls, "delete firewall.lan",
 		"named zone section listed in the template must be kept")
-	assert.Contains(t, mock.Calls, "delete firewall.@rule[0]",
+	assert.Contains(t, mock.Calls, "delete firewall.cfg-rule0",
 		"rule section must still be deleted — it's not in the template at all")
-	assert.Contains(t, mock.Calls, "set firewall.lan.input=ACCEPT")
+	values, ok := setValuesFor(mock, "firewall", "lan")
+	require.True(t, ok)
+	assert.Equal(t, "ACCEPT", values["input"])
 }
 
-func TestApply_ReplaceMode_DeletesAnonSectionsInReverseOrder(t *testing.T) {
-	// Simulates the production failure: network has @bridge-vlan[0..2] but
-	// desired config has no bridge-vlan sections. Without reverse-order deletion,
-	// removing @bridge-vlan[0] shifts [1]→[0] and [2]→[1], so the subsequent
-	// delete of @bridge-vlan[2] fails because the index no longer exists.
+func TestApply_ReplaceMode_DeletesEachAnonSectionByItsStableID(t *testing.T) {
+	// Simulates the production scenario that used to require reverse-order
+	// deletion under the CLI's positional @type[N] addressing: network has three
+	// anonymous bridge-vlan sections and none survive in the desired config.
+	// With real, stable ids there's no index-shift hazard — deletion order no
+	// longer matters, unlike the old @type[N] scheme.
 	mock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"show network": strings.Join([]string{
-				"network.@bridge-vlan[0]=bridge-vlan",
-				"network.@bridge-vlan[0].device='br-lan'",
-				"network.@bridge-vlan[1]=bridge-vlan",
-				"network.@bridge-vlan[1].device='br-lan'",
-				"network.@bridge-vlan[2]=bridge-vlan",
-				"network.@bridge-vlan[2].device='br-lan'",
-			}, "\n"),
+		Sections: map[string][]uci.Section{
+			"network": {
+				{ID: "cfg-bv0", Type: "bridge-vlan", Anonymous: true, Options: map[string]interface{}{"device": "br-lan"}},
+				{ID: "cfg-bv1", Type: "bridge-vlan", Anonymous: true, Options: map[string]interface{}{"device": "br-lan"}},
+				{ID: "cfg-bv2", Type: "bridge-vlan", Anonymous: true, Options: map[string]interface{}{"device": "br-lan"}},
+			},
 		},
 	}
 	a := apply.New(mock)
@@ -525,18 +541,55 @@ func TestApply_ReplaceMode_DeletesAnonSectionsInReverseOrder(t *testing.T) {
 	_, err := a.Apply(json.RawMessage(cfg))
 	require.NoError(t, err)
 
-	// Extract only the bridge-vlan delete calls in the order they were issued.
-	var deleteCalls []string
-	for _, c := range mock.Calls {
-		if strings.HasPrefix(c, "delete network.@bridge-vlan") {
-			deleteCalls = append(deleteCalls, c)
-		}
-	}
+	assert.Contains(t, mock.Calls, "delete network.cfg-bv0")
+	assert.Contains(t, mock.Calls, "delete network.cfg-bv1")
+	assert.Contains(t, mock.Calls, "delete network.cfg-bv2")
+}
 
-	// Deletions must be issued highest-index-first to avoid index shifting.
-	require.Equal(t, []string{
-		"delete network.@bridge-vlan[2]",
-		"delete network.@bridge-vlan[1]",
-		"delete network.@bridge-vlan[0]",
-	}, deleteCalls)
+func TestApply_NamedSection_RetypesWhenExistingTypeDiffers(t *testing.T) {
+	// A named section already exists on the device but under the wrong type —
+	// the one case that still goes through the CLI (RetypeExisting), since
+	// rpcd's uci "set" method has no parameter to change an existing section's type.
+	mock := &uci.MockUCIRunner{
+		Sections: map[string][]uci.Section{
+			"network": {{ID: "wan", Type: "interface", Name: "wan"}},
+		},
+	}
+	a := apply.New(mock)
+
+	cfg := `{
+  "network": {
+    ".mode": "merge",
+    "alias": [{ ".name": "wan", "interface": "wan_dev" }]
+  }
+}`
+	_, err := a.Apply(json.RawMessage(cfg))
+	require.NoError(t, err)
+
+	assert.Contains(t, mock.Calls, "set-type network.wan=alias")
+	assert.NotContains(t, mock.Calls, "add network alias wan",
+		"must not Add a section that already exists on the device")
+}
+
+func TestApply_NamedSection_NoRetypeWhenExistingTypeMatches(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Sections: map[string][]uci.Section{
+			"network": {{ID: "wan", Type: "interface", Name: "wan", Options: map[string]interface{}{"proto": "static"}}},
+		},
+	}
+	a := apply.New(mock)
+
+	cfg := `{
+  "network": {
+    ".mode": "merge",
+    "interface": [{ ".name": "wan", "proto": "dhcp" }]
+  }
+}`
+	_, err := a.Apply(json.RawMessage(cfg))
+	require.NoError(t, err)
+
+	for _, c := range mock.Calls {
+		assert.NotContains(t, c, "set-type", "type already matches — no retype call expected")
+	}
+	assert.NotContains(t, mock.Calls, "add network interface wan")
 }

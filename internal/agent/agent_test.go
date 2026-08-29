@@ -954,18 +954,17 @@ func TestHandleCommand_StripUCIPrefix(t *testing.T) {
 	assert.Contains(t, uciMock.Calls, "raw set network.wan.proto=dhcp")
 }
 
-// systemUCIOutput is minimal valid uci export output for the system package.
-const systemUCIOutput = `package system
-
-config system
-	option hostname 'OpenWrt'
-`
+// systemUCISections is the minimal on-device "system" package state used by
+// tests that exercise publishState and/or config_apply staging against it.
+var systemUCISections = []uci.Section{
+	{ID: "cfg-system0", Type: "system", Anonymous: true, Options: map[string]interface{}{"hostname": "OpenWrt"}},
+}
 
 func TestHandleStateRequest_PublishesStateToCorrectTopic(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -979,8 +978,8 @@ func TestHandleStateRequest_PublishesStateToCorrectTopic(t *testing.T) {
 func TestHandleStateRequest_TriggerIsRequest(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -996,8 +995,8 @@ func TestHandleStateRequest_TriggerIsRequest(t *testing.T) {
 func TestHandleStateRequest_IncludesRequestedPackage(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -1014,11 +1013,11 @@ func TestHandleStateRequest_IncludesRequestedPackage(t *testing.T) {
 func TestHandleStateRequest_SkipsMissingPackage(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 		Errors: map[string]error{
-			"export wireless": assert.AnError,
+			"sections wireless": assert.AnError,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -1038,8 +1037,8 @@ func TestHandleStateRequest_EmptyPackagesList_UsesDefaultPackages(t *testing.T) 
 	mock := mqttclient.NewMockMQTTClient()
 	// Only inject system; all others will silently return empty string → no sections → skipped.
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -1061,8 +1060,8 @@ func TestHandleCommand_ConfigApply_SuccessAcksAndPublishesState(t *testing.T) {
 
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -1105,8 +1104,8 @@ func TestHandleCommand_ConfigApply_SuccessAcksAndPublishesState(t *testing.T) {
 	assert.Equal(t, "ok", ack.Status)
 
 	// UCI staging + commit should have been called.
-	assert.Contains(t, uciMock.Calls, "set-type system.system=system")
-	assert.Contains(t, uciMock.Calls, "set system.system.hostname=router-01")
+	assert.Contains(t, uciMock.Calls, "add system system system")
+	assert.Contains(t, uciMock.Calls, "setvalues system.system")
 	assert.Contains(t, uciMock.Calls, "commit system")
 }
 
@@ -1127,8 +1126,8 @@ func TestHandleCommand_ConfigApply_DuplicateDelivery_Ignored(t *testing.T) {
 
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -1180,7 +1179,7 @@ func TestHandleCommand_ConfigApply_StagingError_AcksError(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
 		Errors: map[string]error{
-			"set system.system.hostname=router-01": assert.AnError,
+			"setvalues system.system": assert.AnError,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -1212,8 +1211,8 @@ func TestHandleCommand_ConfigApply_StagingError_AcksError(t *testing.T) {
 func TestHandleCommand_ConfigApply_StateTriggerIsApplySuccess(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -1254,8 +1253,8 @@ func TestHandleStateRequest_InvalidJSON_NoPanic(t *testing.T) {
 func TestPublishState_ConnectTrigger(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -1379,8 +1378,8 @@ func TestTlsCertFingerprint_MissingFile_ReturnsEmpty(t *testing.T) {
 func TestPublishState_IncludesUnifiedStateReportFields(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
-		Results: map[string]string{
-			"export system": systemUCIOutput,
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
 		},
 	}
 	const pubKeyB64 = "AAAAC3NzaC1lZDI1NTE5AAAA"

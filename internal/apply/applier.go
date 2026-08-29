@@ -108,6 +108,17 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 		parsedSections[sectionType] = sections
 	}
 
+	// Fetch the package's current on-device sections once; every helper below
+	// reads from this snapshot instead of re-fetching (the old Show()-based
+	// code re-fetched and re-parsed the same package once per section type,
+	// per existing type, and per section touched). A fetch error (package
+	// doesn't exist yet) is treated as "no sections" — the same contract
+	// Show()/Export() had.
+	existing, err := a.runner.GetSections(pkgName)
+	if err != nil {
+		existing = nil
+	}
+
 	if mode == "replace" {
 		// Whole-package replace ("wipe + rewrite", docs/config-format.md): delete every
 		// current section in the package — of ANY section type, not just the types this
@@ -123,8 +134,8 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 				}
 			}
 		}
-		for _, existingType := range a.existingSectionTypes(pkgName) {
-			if err := a.deleteUnwantedSections(pkgName, existingType, keepNames); err != nil {
+		for _, existingType := range existingSectionTypes(existing) {
+			if err := a.deleteUnwantedSections(pkgName, existing, existingType, keepNames); err != nil {
 				return err
 			}
 		}
@@ -139,7 +150,7 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 		// repeated apply calls.
 		var existingAnonIDs []string
 		if mode == "merge" {
-			existingAnonIDs = a.listUnnamedSections(pkgName, sectionType)
+			existingAnonIDs = anonymousSectionIDs(existing, sectionType)
 		}
 
 		anonIdx := 0
@@ -151,7 +162,7 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 				}
 				anonIdx++
 			}
-			if err := a.applySection(pkgName, sectionType, section, mode, reuseID); err != nil {
+			if err := a.applySection(pkgName, sectionType, section, existing, reuseID); err != nil {
 				return err
 			}
 		}
@@ -159,136 +170,109 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 	return nil
 }
 
-// showEntry is one parsed "id=value" line from `uci show <pkg>` output, with
-// prefix already stripped from id.
-type showEntry struct {
-	id    string
-	value string
+// findSectionByName returns the existing named section with the given name, or nil.
+func findSectionByName(sections []uci.Section, name string) *uci.Section {
+	for i := range sections {
+		if !sections[i].Anonymous && sections[i].Name == name {
+			return &sections[i]
+		}
+	}
+	return nil
 }
 
-// parseShowLines splits uci show output into entries whose line starts with
-// prefix (stripped from id before returning). Lines without "=" are skipped.
-func parseShowLines(out, prefix string) []showEntry {
-	var entries []showEntry
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, prefix) {
-			continue
+// findSectionByID returns the existing section with the given id, or nil.
+func findSectionByID(sections []uci.Section, id string) *uci.Section {
+	for i := range sections {
+		if sections[i].ID == id {
+			return &sections[i]
 		}
-		rest := strings.TrimPrefix(line, prefix)
-		eqIdx := strings.Index(rest, "=")
-		if eqIdx < 0 {
-			continue
-		}
-		entries = append(entries, showEntry{id: rest[:eqIdx], value: strings.TrimSpace(rest[eqIdx+1:])})
 	}
-	return entries
+	return nil
 }
 
-// listUnnamedSections returns the @type[index] identifiers for all existing
-// anonymous sections of sectionType in pkgName. Returns nil if the package
-// doesn't exist yet or has no anonymous sections of that type.
-func (a *Applier) listUnnamedSections(pkgName, sectionType string) []string {
-	out, err := a.runner.Show(pkgName)
-	if err != nil {
-		return nil
-	}
-	var ids []string
-	for _, entry := range parseShowLines(out, pkgName+".") {
-		// Anonymous sections start with '@'; skip option lines (contain ".").
-		if !strings.HasPrefix(entry.id, "@") || strings.Contains(entry.id, ".") {
-			continue
-		}
-		if entry.value == sectionType {
-			ids = append(ids, entry.id)
-		}
-	}
-	return ids
-}
-
-// existingSectionTypes returns the distinct section types currently present in pkgName
-// on the device (e.g. "rule", "zone", "defaults" for the firewall package), regardless
-// of what the desired payload lists. Returns nil if the package doesn't exist yet.
-func (a *Applier) existingSectionTypes(pkgName string) []string {
-	out, err := a.runner.Show(pkgName)
-	if err != nil {
-		return nil
-	}
+// existingSectionTypes returns the distinct section types currently present
+// in sections, regardless of what the desired payload lists.
+func existingSectionTypes(sections []uci.Section) []string {
 	var types []string
 	seen := make(map[string]bool)
-	for _, entry := range parseShowLines(out, pkgName+".") {
-		if strings.Contains(entry.id, ".") {
-			continue // option line, not a section
-		}
-		if !seen[entry.value] {
-			seen[entry.value] = true
-			types = append(types, entry.value)
+	for _, s := range sections {
+		if !seen[s.Type] {
+			seen[s.Type] = true
+			types = append(types, s.Type)
 		}
 	}
 	return types
 }
 
-// deleteUnwantedSections deletes all current sections of sectionType in pkgName that are
-// not listed in keepNames. Uses `uci show` to enumerate existing sections.
-//
-// Anonymous sections (@type[N]) are deleted in reverse index order so that earlier
-// deletions do not shift the indices of sections still to be deleted.
-func (a *Applier) deleteUnwantedSections(pkgName, sectionType string, keepNames map[string]bool) error {
-	out, err := a.runner.Show(pkgName)
-	if err != nil {
-		// Package doesn't exist yet — nothing to delete.
-		return nil
-	}
-	var toDelete []string
-	for _, entry := range parseShowLines(out, pkgName+".") {
-		// Skip option lines — they contain a "." in the id (e.g. "wan.proto").
-		if strings.Contains(entry.id, ".") {
-			continue
-		}
-		if entry.value != sectionType {
-			continue
-		}
-		if !keepNames[entry.id] {
-			toDelete = append(toDelete, entry.id)
+// anonymousSectionIDs returns the ids of every anonymous section of
+// sectionType, in on-device order.
+func anonymousSectionIDs(sections []uci.Section, sectionType string) []string {
+	var ids []string
+	for _, s := range sections {
+		if s.Anonymous && s.Type == sectionType {
+			ids = append(ids, s.ID)
 		}
 	}
-	// Delete in reverse order: removing @type[0] would shift @type[1] → @type[0],
-	// invalidating all subsequent index-based references. Deleting from the highest
-	// index downward keeps lower indices stable throughout.
-	for i := len(toDelete) - 1; i >= 0; i-- {
-		if err := a.runner.Delete(pkgName, toDelete[i]); err != nil {
-			return fmt.Errorf("delete %s.%s: %w", pkgName, toDelete[i], err)
+	return ids
+}
+
+// deleteUnwantedSections deletes every current section of sectionType not listed in keepNames.
+// Sections carry their real UCI id (name, or a stable cfgXXXXXX for anonymous sections), which
+// never shifts when a sibling section is deleted — unlike the CLI's positional @type[N]
+// addressing, deletion order here doesn't matter.
+func (a *Applier) deleteUnwantedSections(pkgName string, sections []uci.Section, sectionType string, keepNames map[string]bool) error {
+	for _, s := range sections {
+		if s.Type != sectionType {
+			continue
+		}
+		if !s.Anonymous && keepNames[s.Name] {
+			continue
+		}
+		if err := a.runner.Delete(pkgName, s.ID); err != nil {
+			return fmt.Errorf("delete %s.%s: %w", pkgName, s.ID, err)
 		}
 	}
 	return nil
 }
 
 // applySection stages UCI changes for a single section instance.
-// reuseID, when non-empty, is an existing @type[index] identifier that should
-// be updated in place rather than creating a new anonymous section via Add().
-func (a *Applier) applySection(pkgName, sectionType string, section map[string]interface{}, mode string, reuseID string) error {
+// existing is the package's prefetched on-device snapshot (see stagePackage).
+// reuseID, when non-empty, is an existing anonymous section id that should be
+// updated in place rather than creating a new one via Add().
+func (a *Applier) applySection(pkgName, sectionType string, section map[string]interface{}, existing []uci.Section, reuseID string) error {
 	name, hasName := section[".name"].(string)
 
 	var sectionID string
-	if hasName {
+	var existingSec *uci.Section
+	switch {
+	case hasName:
 		sectionID = name
-		// SetType creates the section if it doesn't exist, or updates its type.
-		// In replace mode the section was already deleted by deleteUnwantedSections.
-		if err := a.runner.SetType(pkgName, sectionID, sectionType); err != nil {
-			return fmt.Errorf("set type %s.%s=%s: %w", pkgName, sectionID, sectionType, err)
+		existingSec = findSectionByName(existing, name)
+		switch {
+		case existingSec == nil:
+			// Doesn't exist on the device yet: create it under its desired name.
+			if _, err := a.runner.Add(pkgName, sectionType, sectionID); err != nil {
+				return fmt.Errorf("add %s %s %s: %w", pkgName, sectionType, sectionID, err)
+			}
+		case existingSec.Type != sectionType:
+			if err := a.runner.RetypeExisting(pkgName, sectionID, sectionType); err != nil {
+				return fmt.Errorf("retype %s.%s=%s: %w", pkgName, sectionID, sectionType, err)
+			}
 		}
-	} else if reuseID != "" {
+	case reuseID != "":
 		// Reuse an existing anonymous section instead of appending a new one.
 		sectionID = reuseID
-	} else {
-		id, err := a.runner.Add(pkgName, sectionType)
+		existingSec = findSectionByID(existing, reuseID)
+	default:
+		id, err := a.runner.Add(pkgName, sectionType, "")
 		if err != nil {
 			return fmt.Errorf("add %s %s: %w", pkgName, sectionType, err)
 		}
 		sectionID = id
 	}
 
-	desiredKeys := make(map[string]bool)
+	values := make(map[string]interface{}, len(section))
+	desiredKeys := make(map[string]bool, len(section))
 	for key, val := range section {
 		if strings.HasPrefix(key, ".") {
 			continue
@@ -296,50 +280,53 @@ func (a *Applier) applySection(pkgName, sectionType string, section map[string]i
 		desiredKeys[key] = true
 		switch v := val.(type) {
 		case []interface{}:
-			// List option: clear existing entries, then add each new value.
-			_ = a.runner.DeleteOption(pkgName, sectionID, key)
-			for _, item := range v {
-				if err := a.runner.AddList(pkgName, sectionID, key, fmt.Sprintf("%v", item)); err != nil {
-					return fmt.Errorf("add_list %s.%s.%s: %w", pkgName, sectionID, key, err)
-				}
+			// A UCI list option: the full desired list replaces whatever the
+			// section currently has in one batched call, no separate clear step.
+			list := make([]string, len(v))
+			for i, item := range v {
+				list[i] = fmt.Sprintf("%v", item)
 			}
+			values[key] = list
 		default:
-			if err := a.runner.Set(pkgName, sectionID, key, fmt.Sprintf("%v", val)); err != nil {
-				return fmt.Errorf("set %s.%s.%s: %w", pkgName, sectionID, key, err)
-			}
+			values[key] = fmt.Sprintf("%v", val)
+		}
+	}
+	if len(values) > 0 {
+		if err := a.runner.SetValues(pkgName, sectionID, values); err != nil {
+			return fmt.Errorf("set values %s.%s: %w", pkgName, sectionID, err)
 		}
 	}
 
 	// For named sections or reused anonymous sections: remove options present on the
 	// device but absent from desired. This gives exact-match semantics for the section
 	// content while package-level merge still leaves unmentioned sections untouched.
-	// Newly-created anonymous sections (reuseID=="") have no prior options to clean.
+	// Newly-created sections (existingSec==nil) have no prior options to clean.
 	if hasName || reuseID != "" {
-		if err := a.cleanStaleOptions(pkgName, sectionID, desiredKeys); err != nil {
+		if err := a.cleanStaleOptions(pkgName, sectionID, existingSec, desiredKeys); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// cleanStaleOptions deletes UCI options that exist on the device for the given named
-// section but are not present in the desired config. Uses the existing Show() output.
-func (a *Applier) cleanStaleOptions(pkgName, sectionID string, desiredKeys map[string]bool) error {
-	out, err := a.runner.Show(pkgName)
-	if err != nil {
-		return nil // package not committed yet — nothing to clean
+// cleanStaleOptions deletes options that exist on the device for the given section but are not
+// present in the desired config, using the already-fetched snapshot rather than a fresh read.
+func (a *Applier) cleanStaleOptions(pkgName, sectionID string, existingSec *uci.Section, desiredKeys map[string]bool) error {
+	if existingSec == nil {
+		return nil // freshly created section — nothing to clean
 	}
-	for _, entry := range parseShowLines(out, pkgName+"."+sectionID+".") {
-		optKey := entry.id
-		// Skip dot-prefixed meta-keys and nested paths (sub-option lines).
-		if strings.HasPrefix(optKey, ".") || strings.Contains(optKey, ".") {
-			continue
+	var stale []string
+	for opt := range existingSec.Options {
+		if !desiredKeys[opt] {
+			stale = append(stale, opt)
 		}
-		if !desiredKeys[optKey] {
-			if err := a.runner.DeleteOption(pkgName, sectionID, optKey); err != nil {
-				return fmt.Errorf("delete stale option %s.%s.%s: %w", pkgName, sectionID, optKey, err)
-			}
-		}
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+	sort.Strings(stale) // deterministic call order
+	if err := a.runner.DeleteOptions(pkgName, sectionID, stale); err != nil {
+		return fmt.Errorf("delete stale options %s.%s %v: %w", pkgName, sectionID, stale, err)
 	}
 	return nil
 }

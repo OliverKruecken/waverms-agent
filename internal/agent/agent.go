@@ -1283,16 +1283,12 @@ func (a *Agent) publishState(ctx context.Context, trigger string, pkgs []string)
 	packages := make(map[string]map[string][]map[string]interface{})
 	rawFiles := make(map[string]string)
 	for _, pkg := range pkgs {
-		out, err := a.uci.Export(pkg)
+		fetched, err := a.uci.GetSections(pkg)
 		if err != nil {
-			slog.Warn("uci export failed, skipping", "package", pkg, "err", err)
+			slog.Warn("uci get sections failed, skipping", "package", pkg, "err", err)
 			continue
 		}
-		sections, err := uci.ParseUCIExport(out)
-		if err != nil {
-			slog.Warn("uci export parse failed, skipping", "package", pkg, "err", err)
-			continue
-		}
+		sections := uci.GroupByType(fetched)
 		if len(sections) > 0 {
 			packages[pkg] = sections
 		}
