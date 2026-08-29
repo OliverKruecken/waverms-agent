@@ -334,6 +334,8 @@ var supportedCapabilities = []string{
 	"ubus_listen",
 	"shell_exec",
 	"file_transfer",
+	"ubus_watch_id",
+	"ubus_listen_v2",
 }
 
 // fallbackStatePackages is used only when /etc/config cannot be read.
@@ -529,18 +531,21 @@ type Agent struct {
 	watchdogActive atomic.Bool
 
 	// watchesMu protects watches, the registry of active ubus_watch goroutines
-	// keyed by (object, method). A ubus_watch for a key already present is a
-	// no-op ack — this is what makes the backend's every-report-cycle re-send
-	// idempotent. Each watch goroutine removes its own entry on exit (session
-	// disconnect or explicit ubus_unwatch), so a stale entry never survives a
-	// reconnect — the next ubus_watch for that key always starts fresh.
+	// keyed by makeWatchKey's result — the caller-supplied watch_id when
+	// present, or a synthetic "legacy:<object>.<method>" key otherwise (see
+	// makeWatchKey in ubus_watch.go). A ubus_watch for a key already present
+	// is a no-op ack — this is what makes the backend's every-report-cycle
+	// re-send idempotent. Each watch goroutine removes its own entry on exit
+	// (session disconnect or explicit ubus_unwatch), so a stale entry never
+	// survives a reconnect — the next ubus_watch for that key always starts
+	// fresh.
 	watchesMu sync.Mutex
 	watches   map[watchKey]chan struct{}
 
 	// listensMu protects listens, the registry of active ubus_listen
-	// goroutines keyed by event name — same idempotent-re-dispatch contract
-	// as watches above, just keyed by a bare event name instead of
-	// (object, method) since `ubus listen` takes one argument.
+	// goroutines keyed by makeListenKey's result — same watch_id-or-legacy-
+	// fallback contract as watches above (see makeListenKey in
+	// ubus_listen.go).
 	listensMu sync.Mutex
 	listens   map[string]chan struct{}
 

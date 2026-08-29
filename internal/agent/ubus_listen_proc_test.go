@@ -51,7 +51,7 @@ func TestRealUbusListenStarter_LinesArriveInOrder(t *testing.T) {
 `))
 
 	s := &RealUbusListenStarter{UCI: &uci.RealUCIRunner{}}
-	proc, err := s.Start(context.Background(), "assoc")
+	proc, err := s.Start(context.Background(), "hostapd.", "assoc")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestRealUbusListenStarter_StopKillsProcessAndUnblocksWait(t *testing.T) {
 `))
 
 	s := &RealUbusListenStarter{UCI: &uci.RealUCIRunner{}}
-	proc, err := s.Start(context.Background(), "assoc")
+	proc, err := s.Start(context.Background(), "hostapd.", "assoc")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestRealUbusListenStarter_StartErrorOnMissingBinary(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // empty dir — no ubus binary anywhere on PATH
 
 	s := &RealUbusListenStarter{UCI: &uci.RealUCIRunner{}}
-	_, err := s.Start(context.Background(), "assoc")
+	_, err := s.Start(context.Background(), "hostapd.", "assoc")
 	if err == nil {
 		t.Fatal("expected an error when the ubus binary cannot be found")
 	}
@@ -130,22 +130,22 @@ esac
 `)
 
 	s := &RealUbusListenStarter{UCI: &uci.RealUCIRunner{}}
-	_, err := s.Start(context.Background(), "assoc")
+	_, err := s.Start(context.Background(), "hostapd.", "assoc")
 	if err == nil {
 		t.Fatal("expected an error when no hostapd ubus objects are found")
 	}
 }
 
-func TestHostapdObjects_FiltersToBSSObjectsOnly(t *testing.T) {
+func TestDiscoverUbusObjects_FiltersToPrefixOnly(t *testing.T) {
 	mock := &uci.MockUCIRunner{
 		Results: map[string]string{
 			"cmd ubus list": "hostapd\nhostapd-auth\nhostapd.phy0-ap0\nhostapd.phy0-ap1\nnetwork.interface\n",
 		},
 	}
 
-	got, err := hostapdObjects(mock)
+	got, err := discoverUbusObjects(mock, "hostapd.")
 	if err != nil {
-		t.Fatalf("hostapdObjects: %v", err)
+		t.Fatalf("discoverUbusObjects: %v", err)
 	}
 
 	want := []string{"hostapd.phy0-ap0", "hostapd.phy0-ap1"}
@@ -159,13 +159,38 @@ func TestHostapdObjects_FiltersToBSSObjectsOnly(t *testing.T) {
 	}
 }
 
-func TestHostapdObjects_PropagatesExecError(t *testing.T) {
+func TestDiscoverUbusObjects_ArbitraryPrefixNotJustHostapd(t *testing.T) {
+	// discoverUbusObjects is no longer hostapd-specific — any caller-supplied
+	// prefix works, exercising the generalization finding 6 fixed.
+	mock := &uci.MockUCIRunner{
+		Results: map[string]string{
+			"cmd ubus list": "network.interface.lan\nnetwork.interface.wan\nhostapd.phy0-ap0\nsystem\n",
+		},
+	}
+
+	got, err := discoverUbusObjects(mock, "network.interface.")
+	if err != nil {
+		t.Fatalf("discoverUbusObjects: %v", err)
+	}
+
+	want := []string{"network.interface.lan", "network.interface.wan"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestDiscoverUbusObjects_PropagatesExecError(t *testing.T) {
 	boom := errors.New("boom")
 	mock := &uci.MockUCIRunner{
 		Errors: map[string]error{"cmd ubus list": boom},
 	}
 
-	_, err := hostapdObjects(mock)
+	_, err := discoverUbusObjects(mock, "hostapd.")
 	if err == nil {
 		t.Fatal("expected an error to propagate from ExecCmd")
 	}

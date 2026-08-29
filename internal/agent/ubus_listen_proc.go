@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
-	"regexp"
 	"strings"
 	"syscall"
 
@@ -38,22 +37,25 @@ type UbusListenProcess interface {
 	Stop()
 }
 
-// UbusListenStarter starts a new UbusListenProcess. eventType is not used to
-// build the subprocess's command line (see RealUbusListenStarter) — it exists
-// so the caller (runUbusListen) can filter the unfiltered Lines() stream down
-// to the one notify type it actually asked for.
+// UbusListenStarter starts a new UbusListenProcess. objectPrefix selects
+// which ubus objects to subscribe to (see discoverUbusObjects); eventType is
+// not used to build the subprocess's command line (see RealUbusListenStarter)
+// — it exists so the caller (runUbusListen) can filter the unfiltered Lines()
+// stream down to the one notify type it actually asked for.
 type UbusListenStarter interface {
-	Start(ctx context.Context, eventType string) (UbusListenProcess, error)
+	Start(ctx context.Context, objectPrefix, eventType string) (UbusListenProcess, error)
 }
 
-// hostapdBSSObjectRe matches hostapd's per-BSS ubus objects (e.g.
-// "hostapd.phy0-ap0"), registered one per configured AP interface — as
-// opposed to the two fixed top-level objects "hostapd" and "hostapd-auth",
-// which are excluded.
-var hostapdBSSObjectRe = regexp.MustCompile(`^hostapd\.`)
+// defaultHostapdObjectPrefix is used when a ubus_listen payload omits (or
+// sends empty) object_prefix — reproduces this primitive's original,
+// hardcoded hostapd-only discovery exactly. "hostapd." matches hostapd's
+// per-BSS ubus objects (e.g. "hostapd.phy0-ap0"), registered one per
+// configured AP interface, while excluding the two fixed top-level objects
+// "hostapd" and "hostapd-auth" (too short / no dot).
+const defaultHostapdObjectPrefix = "hostapd."
 
-// RealUbusListenStarter subscribes to hostapd's per-BSS ubus objects and
-// streams their notify events — the production UbusListenStarter.
+// RealUbusListenStarter subscribes to ubus objects matching a caller-supplied
+// prefix and streams their notify events — the production UbusListenStarter.
 //
 // hostapd's assoc/auth/probe notifications are NOT global ubus events
 // (`ubus listen <event>`, backed by `ubus_send_event`) — they are per-object
@@ -63,25 +65,34 @@ var hostapdBSSObjectRe = regexp.MustCompile(`^hostapd\.`)
 // `ubus subscribe <object> [<object>...]` — which, conveniently, prints the
 // identical `{ "<type>": {...} }\n` line format `ubus listen` does (see
 // ubus's own cli.c print_event()), so nothing downstream of Start() needed to
-// change once this was corrected.
+// change once this was corrected. This starter generalizes past hostapd by
+// letting the caller supply which object-name prefix to discover and
+// subscribe to (see discoverUbusObjects) instead of hardcoding it — object
+// discovery via `ubus list` plus a prefix match, not a subsystem-specific
+// API, so any ubus object family that emits per-object subscriber
+// notifications this same way can reuse it.
 //
 // Subscribing to an object yields every notify type it sends — "assoc",
-// "auth", and "probe" all interleaved on the same stream, not just the one
-// eventType asked for — so Lines() is intentionally unfiltered here;
-// runUbusListen filters by eventType before publishing. This also means two
-// concurrent ubus_listen registrations for different event types would each
-// open their own redundant subscription to the same objects — harmless today
-// since the backend only ever requests "assoc", but worth knowing if a
-// second event type is ever added.
+// "auth", and "probe" all interleaved on the same stream for hostapd, not
+// just the one eventType asked for — so Lines() is intentionally unfiltered
+// here; runUbusListen filters by eventType before publishing. This also
+// means two concurrent ubus_listen registrations for different event types
+// targeting the same object prefix would each open their own redundant
+// subscription to those objects — harmless today since the backend only ever
+// requests "assoc", but worth knowing if a second event type is ever added.
 type RealUbusListenStarter struct {
 	UCI uci.UCIRunner
 }
 
-// hostapdObjects runs `ubus list` and returns every per-BSS hostapd object on
-// this device, discovered fresh on each Start() so a reconfigured radio
-// (interface added/removed/renamed) is picked up on the next restart rather
-// than needing an agent restart.
-func hostapdObjects(runner uci.UCIRunner) ([]string, error) {
+// discoverUbusObjects runs `ubus list` and returns every object whose name
+// starts with prefix, discovered fresh on each Start() so a reconfigured
+// device (radio interface added/removed/renamed, or any other prefix-matched
+// subsystem) is picked up on the next restart rather than needing an agent
+// restart. Prefix, not a compiled pattern: OpenWrt's own ubus ACL vocabulary
+// (/usr/share/rpcd/acl.d/*.json, e.g. "hostapd.*") is glob/prefix-based, not
+// regex, and this primitive's original hardcoded hostapd discovery already
+// reduced to nothing more than a prefix match — see docs/roaming.md.
+func discoverUbusObjects(runner uci.UCIRunner, prefix string) ([]string, error) {
 	out, err := runner.ExecCmd("ubus", "list")
 	if err != nil {
 		return nil, fmt.Errorf("ubus list: %w", err)
@@ -89,20 +100,20 @@ func hostapdObjects(runner uci.UCIRunner) ([]string, error) {
 	var objects []string
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
-		if hostapdBSSObjectRe.MatchString(line) {
+		if strings.HasPrefix(line, prefix) {
 			objects = append(objects, line)
 		}
 	}
 	return objects, nil
 }
 
-func (s *RealUbusListenStarter) Start(ctx context.Context, _ string) (UbusListenProcess, error) {
-	objects, err := hostapdObjects(s.UCI)
+func (s *RealUbusListenStarter) Start(ctx context.Context, objectPrefix, _ string) (UbusListenProcess, error) {
+	objects, err := discoverUbusObjects(s.UCI, objectPrefix)
 	if err != nil {
 		return nil, err
 	}
 	if len(objects) == 0 {
-		return nil, fmt.Errorf("no hostapd ubus objects found")
+		return nil, fmt.Errorf("no ubus objects found matching prefix %q", objectPrefix)
 	}
 
 	cmd := exec.CommandContext(ctx, "ubus", append([]string{"subscribe"}, objects...)...)
@@ -180,13 +191,19 @@ func (p *realUbusListenProcess) Stop() {
 // synthetic lines onto it and closing it (with an injected exit error) to
 // simulate a crash.
 type MockUbusListenStarter struct {
-	StartCalls       []string // eventType per call, in order
+	StartCalls       []UbusListenStartCall // (objectPrefix, eventType) per call, in order
 	StartErr         error
 	StartedProcesses []*MockUbusListenProcess
 }
 
-func (m *MockUbusListenStarter) Start(_ context.Context, eventType string) (UbusListenProcess, error) {
-	m.StartCalls = append(m.StartCalls, eventType)
+// UbusListenStartCall records one call to MockUbusListenStarter.Start.
+type UbusListenStartCall struct {
+	ObjectPrefix string
+	EventType    string
+}
+
+func (m *MockUbusListenStarter) Start(_ context.Context, objectPrefix, eventType string) (UbusListenProcess, error) {
+	m.StartCalls = append(m.StartCalls, UbusListenStartCall{ObjectPrefix: objectPrefix, EventType: eventType})
 	if m.StartErr != nil {
 		return nil, m.StartErr
 	}

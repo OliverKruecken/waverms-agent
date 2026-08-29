@@ -33,13 +33,13 @@ func TestHandleUbusListen_StartsListenAndAcksOk(t *testing.T) {
 	a := newUbusListenTestAgent(mqttMock, starter)
 
 	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
-	t.Cleanup(func() { a.listensMu.Lock(); close(a.listens["assoc"]); a.listensMu.Unlock() })
+	t.Cleanup(func() { a.listensMu.Lock(); close(a.listens[makeListenKey("", "assoc")]); a.listensMu.Unlock() })
 
 	if status := lastAckStatus(mqttMock); status != "ok" {
 		t.Errorf("status = %q, want ok", status)
 	}
 	waitForCondition(t, func() bool { return len(starter.StartCalls) == 1 })
-	if starter.StartCalls[0] != "assoc" {
+	if starter.StartCalls[0].EventType != "assoc" {
 		t.Errorf("StartCalls = %v, want exactly one call for %q", starter.StartCalls, "assoc")
 	}
 }
@@ -51,7 +51,7 @@ func TestHandleUbusListen_AlreadyListeningIsNoOp(t *testing.T) {
 
 	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
 	a.listensMu.Lock()
-	firstStop := a.listens["assoc"]
+	firstStop := a.listens[makeListenKey("", "assoc")]
 	a.listensMu.Unlock()
 	t.Cleanup(func() { close(firstStop) })
 
@@ -97,7 +97,7 @@ func TestHandleUbusUnlisten_StopsListenAndProcess(t *testing.T) {
 		t.Errorf("status = %q, want ok", status)
 	}
 	a.listensMu.Lock()
-	_, listening := a.listens["assoc"]
+	_, listening := a.listens[makeListenKey("", "assoc")]
 	a.listensMu.Unlock()
 	if listening {
 		t.Error("expected the listen to be removed from the registry after ubus_unlisten")
@@ -168,7 +168,7 @@ func TestRunUbusListen_PublishesEachLineToUbusEventTopic(t *testing.T) {
 	}
 
 	a.listensMu.Lock()
-	close(a.listens["assoc"])
+	close(a.listens[makeListenKey("", "assoc")])
 	a.listensMu.Unlock()
 }
 
@@ -214,7 +214,7 @@ func TestRunUbusListen_FiltersOutNonMatchingEventTypes(t *testing.T) {
 	}
 
 	a.listensMu.Lock()
-	close(a.listens["assoc"])
+	close(a.listens[makeListenKey("", "assoc")])
 	a.listensMu.Unlock()
 }
 
@@ -233,12 +233,12 @@ func TestRunUbusListen_RestartsAfterUnexpectedExit(t *testing.T) {
 	starter.StartedProcesses[0].SimulateExit(errors.New("ubusd restarted"))
 
 	waitForCondition(t, func() bool { return len(starter.StartedProcesses) == 2 })
-	if starter.StartCalls[1] != "assoc" {
-		t.Errorf("restart StartCalls[1] = %q, want assoc", starter.StartCalls[1])
+	if starter.StartCalls[1].EventType != "assoc" {
+		t.Errorf("restart StartCalls[1] = %+v, want EventType assoc", starter.StartCalls[1])
 	}
 
 	a.listensMu.Lock()
-	close(a.listens["assoc"])
+	close(a.listens[makeListenKey("", "assoc")])
 	a.listensMu.Unlock()
 }
 
@@ -258,7 +258,7 @@ func TestRunUbusListen_SessionDisconnectTearsDownAndStopsProcess(t *testing.T) {
 	waitForCondition(t, func() bool {
 		a.listensMu.Lock()
 		defer a.listensMu.Unlock()
-		_, listening := a.listens["assoc"]
+		_, listening := a.listens[makeListenKey("", "assoc")]
 		return !listening
 	})
 	if !starter.StartedProcesses[0].Stopped {

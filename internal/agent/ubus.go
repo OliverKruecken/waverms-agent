@@ -27,6 +27,10 @@ type UbusCallPayload struct {
 // shell so this isn't strictly an injection vector, but ubus object/method
 // names are a controlled, well-known vocabulary and malformed input should
 // fail cleanly here rather than reach ubus and produce a confusing error.
+// Also used to validate ubus_listen's Event and ObjectPrefix (ubus_listen.go)
+// — object names, method names, notify-type/event keys, and object-name
+// prefixes are all drawn from the identical ubus naming vocabulary, so one
+// shared pattern covers all of them rather than each having its own copy.
 var ubusObjectMethodRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 
 // runUbusCall executes `ubus call <object> <method> <params>` via runner and

@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -14,11 +13,29 @@ import (
 // non-positive) interval_seconds.
 const ubusWatchDefaultInterval = 30 * time.Second
 
-// watchKey identifies one ubus object/method pair. A watch is deduped by this
-// key alone — deliberately not by cmd_id or any backend-assigned identifier,
-// so re-sending ubus_watch for the same pair (the backend does this every
-// report cycle) is a cheap no-op rather than starting a redundant goroutine.
-type watchKey struct{ object, method string }
+// watchKey identifies one standing ubus_watch goroutine in a.watches — see
+// makeWatchKey for how it's resolved.
+type watchKey string
+
+// makeWatchKey resolves the registry key for one ubus_watch registration: the
+// caller-supplied WatchID when present (stable across re-dispatch — the
+// backend re-sends ubus_watch every report cycle for the life of the watch,
+// so the id must stay the same across calls or the agent's dedup below would
+// treat every re-dispatch as a brand-new watch), or a synthetic
+// "legacy:<object>.<method>" key for callers (or already-in-flight commands)
+// that don't supply one — preserving the original dedup-by-(object,method)
+// contract exactly. Two distinct WatchIDs targeting the same (object,
+// method) now run two independent polling goroutines rather than sharing
+// one — a deliberate tradeoff (duplicate `ubus call` traffic, bounded by the
+// number of distinct declared watches, not fleet size) in exchange for
+// unwatch/push-correlation that's exact per registration instead of per ubus
+// target — see docs/plugins.md "Watch/listen ids".
+func makeWatchKey(watchID, object, method string) watchKey {
+	if watchID != "" {
+		return watchKey(watchID)
+	}
+	return watchKey("legacy:" + object + "." + method)
+}
 
 // UbusWatchPayload is the inner payload for type "ubus_watch": start (or
 // confirm) a standing watch that re-runs `ubus call <object> <method>
@@ -30,16 +47,30 @@ type UbusWatchPayload struct {
 	Method          string          `json:"method"`
 	Params          json.RawMessage `json:"params,omitempty"`
 	IntervalSeconds int             `json:"interval_seconds,omitempty"`
+	// WatchID is a caller-assigned, stable-across-re-dispatch identifier —
+	// see makeWatchKey. Optional: omitted, dedup falls back to (object,
+	// method) exactly as before this field existed.
+	WatchID string `json:"watch_id,omitempty"`
 }
 
 // UbusUnwatchPayload is the inner payload for type "ubus_unwatch".
 type UbusUnwatchPayload struct {
-	Object string `json:"object"`
-	Method string `json:"method"`
+	Object  string `json:"object"`
+	Method  string `json:"method"`
+	WatchID string `json:"watch_id,omitempty"`
+}
+
+// ubusStatusPayload is the wire shape published to device/{id}/ubus-status —
+// see runUbusWatch.
+type ubusStatusPayload struct {
+	Object  string          `json:"object"`
+	Method  string          `json:"method"`
+	Result  json.RawMessage `json:"result"`
+	WatchID string          `json:"watch_id,omitempty"`
 }
 
 // handleUbusWatch starts a standing ubus watch, or no-ops if one for the same
-// (object, method) is already running — see watchKey's dedup contract.
+// key is already running — see makeWatchKey's dedup contract.
 func (a *Agent) handleUbusWatch(cmd Command) {
 	var payload UbusWatchPayload
 	if !a.decodeOrAck(cmd, &payload) {
@@ -56,25 +87,17 @@ func (a *Agent) handleUbusWatch(cmd Command) {
 	if interval <= 0 {
 		interval = ubusWatchDefaultInterval
 	}
-	key := watchKey{object: payload.Object, method: payload.Method}
+	key := makeWatchKey(payload.WatchID, payload.Object, payload.Method)
 
-	a.watchesMu.Lock()
-	_, alreadyWatching := a.watches[key]
-	var stop chan struct{}
-	if !alreadyWatching {
-		stop = make(chan struct{})
-		a.watches[key] = stop
-	}
-	a.watchesMu.Unlock()
-
+	stop, alreadyWatching := startOrNoop(&a.watchesMu, a.watches, key)
 	if alreadyWatching {
-		slog.Debug("ubus_watch: already watching, no-op", "cmd_id", cmd.CmdID, "object", payload.Object, "method", payload.Method)
+		slog.Debug("ubus_watch: already watching, no-op", "cmd_id", cmd.CmdID, "object", payload.Object, "method", payload.Method, "watch_id", payload.WatchID)
 		a.publishAck(cmd.CmdID, "ok", "")
 		return
 	}
 
-	slog.Info("ubus_watch: starting", "cmd_id", cmd.CmdID, "object", payload.Object, "method", payload.Method, "interval", interval)
-	go a.runUbusWatch(key, payload.Params, interval, stop)
+	slog.Info("ubus_watch: starting", "cmd_id", cmd.CmdID, "object", payload.Object, "method", payload.Method, "interval", interval, "watch_id", payload.WatchID)
+	go a.runUbusWatch(key, payload.WatchID, payload.Object, payload.Method, payload.Params, interval, stop)
 	a.publishAck(cmd.CmdID, "ok", "")
 }
 
@@ -85,40 +108,28 @@ func (a *Agent) handleUbusUnwatch(cmd Command) {
 	if !a.decodeOrAck(cmd, &payload) {
 		return
 	}
-	key := watchKey{object: payload.Object, method: payload.Method}
+	key := makeWatchKey(payload.WatchID, payload.Object, payload.Method)
 
-	a.watchesMu.Lock()
-	stop, found := a.watches[key]
-	if found {
-		delete(a.watches, key)
-	}
-	a.watchesMu.Unlock()
-
+	stop, found := stopKey(&a.watchesMu, a.watches, key)
 	if found {
 		close(stop)
-		slog.Info("ubus_watch: stopped", "cmd_id", cmd.CmdID, "object", payload.Object, "method", payload.Method)
+		slog.Info("ubus_watch: stopped", "cmd_id", cmd.CmdID, "object", payload.Object, "method", payload.Method, "watch_id", payload.WatchID)
 	} else {
-		slog.Debug("ubus_unwatch: not watching, no-op", "cmd_id", cmd.CmdID, "object", payload.Object, "method", payload.Method)
+		slog.Debug("ubus_unwatch: not watching, no-op", "cmd_id", cmd.CmdID, "object", payload.Object, "method", payload.Method, "watch_id", payload.WatchID)
 	}
 	a.publishAck(cmd.CmdID, "ok", "")
 }
 
-// runUbusWatch re-runs `ubus call key.object key.method params` every
-// interval — waiting for the PREVIOUS call to finish before scheduling the
-// next (time.After, not a ticker), so a slow ubus call can never overlap
-// with itself — and publishes each successful result to device/{id}/ubus-status.
+// runUbusWatch re-runs `ubus call object method params` every interval —
+// waiting for the PREVIOUS call to finish before scheduling the next
+// (time.After, not a ticker), so a slow ubus call can never overlap with
+// itself — and publishes each successful result to device/{id}/ubus-status.
 // A failed call is skipped (logged, not published); the next tick retries.
 // Exits when stop is closed (explicit ubus_unwatch) or the session ends,
 // removing its own registry entry either way so a later ubus_watch for the
 // same key starts fresh rather than seeing a stale no-op.
-func (a *Agent) runUbusWatch(key watchKey, params json.RawMessage, interval time.Duration, stop chan struct{}) {
-	defer func() {
-		a.watchesMu.Lock()
-		if a.watches[key] == stop {
-			delete(a.watches, key)
-		}
-		a.watchesMu.Unlock()
-	}()
+func (a *Agent) runUbusWatch(key watchKey, watchID, object, method string, params json.RawMessage, interval time.Duration, stop chan struct{}) {
+	defer cleanupOwnEntry(&a.watchesMu, a.watches, key, stop)
 
 	disconnCh := a.getSessionDisconnCh()
 	for {
@@ -130,23 +141,25 @@ func (a *Agent) runUbusWatch(key watchKey, params json.RawMessage, interval time
 		case <-time.After(interval):
 		}
 
-		result, err := runUbusCall(a.uci, key.object, key.method, params)
+		result, err := runUbusCall(a.uci, object, method, params)
 		if err != nil {
-			slog.Debug("ubus_watch: call failed, skipping tick", "object", key.object, "method", key.method, "err", err)
+			slog.Debug("ubus_watch: call failed, skipping tick", "object", object, "method", method, "err", err)
+			continue
+		}
+
+		payload, err := json.Marshal(ubusStatusPayload{Object: object, Method: method, Result: json.RawMessage(result), WatchID: watchID})
+		if err != nil {
+			// A malformed ubus result (or, in principle, a marshal failure)
+			// fails safely here rather than publishing broken JSON — the next
+			// tick retries, same tolerance as a failed ubus call above.
+			slog.Error("ubus_watch: marshal payload failed, skipping tick", "object", object, "method", method, "err", err)
 			continue
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		payload := fmt.Appendf(nil, `{"object":%s,"method":%s,"result":%s}`, jsonString(key.object), jsonString(key.method), result)
 		if err := a.mqtt.Publish(ctx, mqttclient.TopicUbusStatus(a.creds.DeviceID), payload, 1, false); err != nil {
-			slog.Error("ubus_watch: publish failed", "object", key.object, "method", key.method, "err", err)
+			slog.Error("ubus_watch: publish failed", "object", object, "method", method, "err", err)
 		}
 		cancel()
 	}
-}
-
-// jsonString marshals a Go string to its JSON string-literal form (quoting/escaping) for building the hand-assembled ubus-status payload above.
-func jsonString(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
 }

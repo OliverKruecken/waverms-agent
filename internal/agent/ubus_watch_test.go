@@ -21,14 +21,14 @@ func TestHandleUbusWatch_StartsWatchAndAcksOk(t *testing.T) {
 		Payload: []byte(`{"object":"usteer","method":"connected_clients","interval_seconds":3600}`),
 	}
 	a.handleUbusWatch(cmd)
-	t.Cleanup(func() { close(a.watches[watchKey{"usteer", "connected_clients"}]) })
+	t.Cleanup(func() { close(a.watches[makeWatchKey("", "usteer", "connected_clients")]) })
 
 	if status := lastAckStatus(mqttMock); status != "ok" {
 		t.Errorf("status = %q, want ok", status)
 	}
 
 	a.watchesMu.Lock()
-	_, watching := a.watches[watchKey{"usteer", "connected_clients"}]
+	_, watching := a.watches[makeWatchKey("", "usteer", "connected_clients")]
 	a.watchesMu.Unlock()
 	if !watching {
 		t.Error("expected a registered watch for (usteer, connected_clients)")
@@ -43,7 +43,7 @@ func TestHandleUbusWatch_AlreadyWatchingIsNoOp(t *testing.T) {
 	cmd := Command{CmdID: "watch-1", Type: "ubus_watch", Payload: []byte(`{"object":"usteer","method":"connected_clients","interval_seconds":3600}`)}
 	a.handleUbusWatch(cmd)
 	a.watchesMu.Lock()
-	firstStop := a.watches[watchKey{"usteer", "connected_clients"}]
+	firstStop := a.watches[makeWatchKey("", "usteer", "connected_clients")]
 	a.watchesMu.Unlock()
 	t.Cleanup(func() { close(firstStop) })
 
@@ -56,7 +56,7 @@ func TestHandleUbusWatch_AlreadyWatchingIsNoOp(t *testing.T) {
 	}
 
 	a.watchesMu.Lock()
-	secondStop := a.watches[watchKey{"usteer", "connected_clients"}]
+	secondStop := a.watches[makeWatchKey("", "usteer", "connected_clients")]
 	count := len(a.watches)
 	a.watchesMu.Unlock()
 	if count != 1 {
@@ -111,7 +111,7 @@ func TestHandleUbusUnwatch_StopsWatch(t *testing.T) {
 	}
 
 	a.watchesMu.Lock()
-	_, watching := a.watches[watchKey{"usteer", "connected_clients"}]
+	_, watching := a.watches[makeWatchKey("", "usteer", "connected_clients")]
 	a.watchesMu.Unlock()
 	if watching {
 		t.Error("expected the watch to be removed from the registry after ubus_unwatch")
@@ -140,7 +140,7 @@ func TestRunUbusWatch_PublishesOnEachTick(t *testing.T) {
 	a := newTestAgent(mqttMock, mock)
 
 	stop := make(chan struct{})
-	go a.runUbusWatch(watchKey{"usteer", "connected_clients"}, nil, 5*time.Millisecond, stop)
+	go a.runUbusWatch(makeWatchKey("", "usteer", "connected_clients"), "", "usteer", "connected_clients", nil, 5*time.Millisecond, stop)
 	time.Sleep(35 * time.Millisecond)
 	close(stop)
 	time.Sleep(5 * time.Millisecond) // let the deferred registry cleanup run
@@ -170,7 +170,7 @@ func TestRunUbusWatch_PublishesOnEachTick(t *testing.T) {
 	}
 
 	a.watchesMu.Lock()
-	_, stillRegistered := a.watches[watchKey{"usteer", "connected_clients"}]
+	_, stillRegistered := a.watches[makeWatchKey("", "usteer", "connected_clients")]
 	a.watchesMu.Unlock()
 	if stillRegistered {
 		t.Error("expected the watch to remove its own registry entry after stopping")
@@ -187,7 +187,7 @@ func TestRunUbusWatch_SkipsFailedCallWithoutPublishing(t *testing.T) {
 	a := newTestAgent(mqttMock, mock)
 
 	stop := make(chan struct{})
-	go a.runUbusWatch(watchKey{"usteer", "connected_clients"}, nil, 5*time.Millisecond, stop)
+	go a.runUbusWatch(makeWatchKey("", "usteer", "connected_clients"), "", "usteer", "connected_clients", nil, 5*time.Millisecond, stop)
 	time.Sleep(20 * time.Millisecond)
 	close(stop)
 	time.Sleep(5 * time.Millisecond)

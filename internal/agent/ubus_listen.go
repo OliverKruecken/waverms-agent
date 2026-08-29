@@ -3,9 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
-	"regexp"
 	"time"
 
 	mqttclient "github.com/OliverKruecken/waverms-agent/internal/mqtt"
@@ -23,12 +21,17 @@ var (
 	ubusListenStableAfter = 30 * time.Second
 )
 
-// ubusEventNameRe restricts Event to ubus's own notify-type vocabulary
-// (alphanumeric, underscore, dot, dash). It's compared for an exact match
-// against each received line's own type key (see ubusLineMatchesType) —
-// unlike a literal `ubus listen <event>` argument, it is never passed to a
-// ubus command line (see RealUbusListenStarter).
-var ubusEventNameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
+// makeListenKey resolves the registry key for one ubus_listen registration —
+// same id-or-legacy-fallback contract as makeWatchKey (see its doc comment
+// in ubus_watch.go): a caller-supplied WatchID when present, or a synthetic
+// "legacy:<event>" key otherwise, preserving the original dedup-by-event
+// contract exactly.
+func makeListenKey(watchID, event string) string {
+	if watchID != "" {
+		return watchID
+	}
+	return "legacy:" + event
+}
 
 // UbusListenPayload is the inner payload for type "ubus_listen": start (or
 // confirm) a standing subscription (see RealUbusListenStarter) whose lines
@@ -38,45 +41,68 @@ var ubusEventNameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 // the instant ubus emits them.
 type UbusListenPayload struct {
 	Event string `json:"event"`
+	// ObjectPrefix selects which ubus objects to subscribe to (any object
+	// name returned by `ubus list` that starts with this prefix) — see
+	// RealUbusListenStarter/discoverUbusObjects. Optional: empty defaults to
+	// defaultHostapdObjectPrefix, reproducing this primitive's original
+	// hostapd-only behavior exactly.
+	ObjectPrefix string `json:"object_prefix,omitempty"`
+	// WatchID is a caller-assigned, stable-across-re-dispatch identifier —
+	// see makeListenKey. Optional: omitted, dedup falls back to Event alone
+	// exactly as before this field existed.
+	WatchID string `json:"watch_id,omitempty"`
 }
 
 // UbusUnlistenPayload is the inner payload for type "ubus_unlisten".
 type UbusUnlistenPayload struct {
-	Event string `json:"event"`
+	Event   string `json:"event"`
+	WatchID string `json:"watch_id,omitempty"`
+}
+
+// ubusEventPayload is the wire shape published to device/{id}/ubus-event —
+// see publishUbusEvent.
+type ubusEventPayload struct {
+	Event      string          `json:"event"`
+	Data       json.RawMessage `json:"data"`
+	ReceivedAt string          `json:"received_at"`
+	WatchID    string          `json:"watch_id,omitempty"`
 }
 
 // handleUbusListen starts a standing ubus listen, or no-ops if one for the
-// same event is already running — mirrors ubus_watch's dedup contract, keyed
-// by event name alone.
+// same key is already running — mirrors ubus_watch's dedup contract, see
+// makeListenKey.
 func (a *Agent) handleUbusListen(cmd Command) {
 	var payload UbusListenPayload
 	if !a.decodeOrAck(cmd, &payload) {
 		return
 	}
 
-	if !ubusEventNameRe.MatchString(payload.Event) {
+	if !ubusObjectMethodRe.MatchString(payload.Event) {
 		slog.Error("ubus_listen rejected: invalid event", "cmd_id", cmd.CmdID, "event", payload.Event)
 		a.publishAck(cmd.CmdID, "error", "invalid event")
 		return
 	}
-
-	a.listensMu.Lock()
-	_, already := a.listens[payload.Event]
-	var stop chan struct{}
-	if !already {
-		stop = make(chan struct{})
-		a.listens[payload.Event] = stop
+	if payload.ObjectPrefix != "" && !ubusObjectMethodRe.MatchString(payload.ObjectPrefix) {
+		slog.Error("ubus_listen rejected: invalid object_prefix", "cmd_id", cmd.CmdID, "object_prefix", payload.ObjectPrefix)
+		a.publishAck(cmd.CmdID, "error", "invalid object_prefix")
+		return
 	}
-	a.listensMu.Unlock()
 
+	objectPrefix := payload.ObjectPrefix
+	if objectPrefix == "" {
+		objectPrefix = defaultHostapdObjectPrefix
+	}
+	key := makeListenKey(payload.WatchID, payload.Event)
+
+	stop, already := startOrNoop(&a.listensMu, a.listens, key)
 	if already {
-		slog.Debug("ubus_listen: already listening, no-op", "cmd_id", cmd.CmdID, "event", payload.Event)
+		slog.Debug("ubus_listen: already listening, no-op", "cmd_id", cmd.CmdID, "event", payload.Event, "watch_id", payload.WatchID)
 		a.publishAck(cmd.CmdID, "ok", "")
 		return
 	}
 
-	slog.Info("ubus_listen: starting", "cmd_id", cmd.CmdID, "event", payload.Event)
-	go a.runUbusListen(payload.Event, stop)
+	slog.Info("ubus_listen: starting", "cmd_id", cmd.CmdID, "event", payload.Event, "object_prefix", objectPrefix, "watch_id", payload.WatchID)
+	go a.runUbusListen(key, payload.WatchID, payload.Event, objectPrefix, stop)
 	a.publishAck(cmd.CmdID, "ok", "")
 }
 
@@ -88,19 +114,14 @@ func (a *Agent) handleUbusUnlisten(cmd Command) {
 	if !a.decodeOrAck(cmd, &payload) {
 		return
 	}
+	key := makeListenKey(payload.WatchID, payload.Event)
 
-	a.listensMu.Lock()
-	stop, found := a.listens[payload.Event]
-	if found {
-		delete(a.listens, payload.Event)
-	}
-	a.listensMu.Unlock()
-
+	stop, found := stopKey(&a.listensMu, a.listens, key)
 	if found {
 		close(stop)
-		slog.Info("ubus_listen: stopped", "cmd_id", cmd.CmdID, "event", payload.Event)
+		slog.Info("ubus_listen: stopped", "cmd_id", cmd.CmdID, "event", payload.Event, "watch_id", payload.WatchID)
 	} else {
-		slog.Debug("ubus_unlisten: not listening, no-op", "cmd_id", cmd.CmdID, "event", payload.Event)
+		slog.Debug("ubus_unlisten: not listening, no-op", "cmd_id", cmd.CmdID, "event", payload.Event, "watch_id", payload.WatchID)
 	}
 	a.publishAck(cmd.CmdID, "ok", "")
 }
@@ -112,14 +133,8 @@ func (a *Agent) handleUbusUnlisten(cmd Command) {
 // the subprocess first) on explicit unlisten or session end, removing its
 // own registry entry either way, same session-scoped-cleanup contract as
 // runUbusWatch.
-func (a *Agent) runUbusListen(event string, stop chan struct{}) {
-	defer func() {
-		a.listensMu.Lock()
-		if a.listens[event] == stop {
-			delete(a.listens, event)
-		}
-		a.listensMu.Unlock()
-	}()
+func (a *Agent) runUbusListen(key, watchID, event, objectPrefix string, stop chan struct{}) {
+	defer cleanupOwnEntry(&a.listensMu, a.listens, key, stop)
 
 	disconnCh := a.getSessionDisconnCh()
 	backoff := ubusListenBaseBackoff
@@ -134,7 +149,7 @@ func (a *Agent) runUbusListen(event string, stop chan struct{}) {
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
-		proc, err := a.ubusListenStarter.Start(ctx, event)
+		proc, err := a.ubusListenStarter.Start(ctx, objectPrefix, event)
 		if err != nil {
 			cancel()
 			slog.Error("ubus_listen: start failed, retrying", "event", event, "err", err, "backoff", backoff)
@@ -156,7 +171,7 @@ func (a *Agent) runUbusListen(event string, stop chan struct{}) {
 				if !ubusLineMatchesType(line, event) {
 					continue
 				}
-				a.publishUbusEvent(event, line)
+				a.publishUbusEvent(event, watchID, line)
 			}
 			close(done)
 		}()
@@ -207,14 +222,24 @@ func ubusLineMatchesType(line, eventType string) bool {
 
 // publishUbusEvent wraps one raw ubus JSON line — deliberately not
 // reinterpreted, same "the agent never interprets ubus output" philosophy as
-// ubus_call/ubus_watch — with the requested event name and the agent's local
-// receipt timestamp (hostapd's own event payload carries no timestamp), and
-// publishes it to device/{id}/ubus-event.
-func (a *Agent) publishUbusEvent(event, rawLine string) {
+// ubus_call/ubus_watch — with the requested event name, the resolved
+// watch_id (if any), and the agent's local receipt timestamp (hostapd's own
+// event payload carries no timestamp), and publishes it to
+// device/{id}/ubus-event.
+func (a *Agent) publishUbusEvent(event, watchID, rawLine string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	payload := fmt.Appendf(nil, `{"event":%s,"data":%s,"received_at":%s}`,
-		jsonString(event), rawLine, jsonString(time.Now().UTC().Format(time.RFC3339Nano)))
+
+	payload, err := json.Marshal(ubusEventPayload{
+		Event:      event,
+		Data:       json.RawMessage(rawLine),
+		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		WatchID:    watchID,
+	})
+	if err != nil {
+		slog.Error("ubus_listen: marshal payload failed, dropping event", "event", event, "err", err)
+		return
+	}
 	if err := a.mqtt.Publish(ctx, mqttclient.TopicUbusEvent(a.creds.DeviceID), payload, 1, false); err != nil {
 		slog.Error("ubus_listen: publish failed", "event", event, "err", err)
 	}
