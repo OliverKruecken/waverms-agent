@@ -336,6 +336,7 @@ var supportedCapabilities = []string{
 	"file_transfer",
 	"ubus_watch_id",
 	"ubus_listen_v2",
+	"ubus_list",
 }
 
 // fallbackStatePackages is used only when /etc/config cannot be read.
@@ -710,6 +711,7 @@ func New(opts *Options) *Agent {
 		"log_control":      a.handleLogControl,
 		"logs_fetch":       a.handleLogsFetch,
 		"ubus_call":        a.handleUbusCall,
+		"ubus_list":        a.handleUbusList,
 		"ubus_watch":       a.handleUbusWatch,
 		"ubus_unwatch":     a.handleUbusUnwatch,
 		"ubus_listen":      a.handleUbusListen,

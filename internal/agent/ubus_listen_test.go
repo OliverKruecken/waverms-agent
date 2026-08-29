@@ -102,9 +102,9 @@ func TestHandleUbusUnlisten_StopsListenAndProcess(t *testing.T) {
 	if listening {
 		t.Error("expected the listen to be removed from the registry after ubus_unlisten")
 	}
-	if !starter.StartedProcesses[0].Stopped {
-		t.Error("expected the subprocess to be stopped")
-	}
+	// Stop() is observed by runUbusListen's goroutine asynchronously (a select on the closed
+	// stop channel), so a synchronous read right after close(stop) races it — poll instead.
+	waitForCondition(t, func() bool { return starter.StartedProcesses[0].Stopped })
 }
 
 func TestHandleUbusUnlisten_NotListeningIsNoOpNotError(t *testing.T) {

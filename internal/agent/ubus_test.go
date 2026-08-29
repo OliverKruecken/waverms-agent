@@ -233,6 +233,251 @@ func TestHandleUbusCall_InvalidPayloadRejectedWithoutExec(t *testing.T) {
 	}
 }
 
+func TestRunUbusList_BuildsPlainListArgv(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Results: map[string]string{
+			`cmd ubus list`: "dhcp\ndnsmasq\nnetwork\n",
+		},
+	}
+
+	out, err := runUbusList(mock, "", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "dhcp\ndnsmasq\nnetwork\n" {
+		t.Errorf("out = %q", out)
+	}
+	if len(mock.Calls) != 1 || mock.Calls[0] != `cmd ubus list` {
+		t.Errorf("unexpected calls recorded: %+v", mock.Calls)
+	}
+}
+
+func TestRunUbusList_BuildsPathAndVerboseArgv(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Results: map[string]string{
+			`cmd ubus -v list network.interface.lan`: `'network.interface.lan' @099f0c8b` + "\n" + `"up": {  }` + "\n",
+		},
+	}
+
+	out, err := runUbusList(mock, "network.interface.lan", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out == "" {
+		t.Error("expected non-empty verbose output")
+	}
+	if len(mock.Calls) != 1 || mock.Calls[0] != `cmd ubus -v list network.interface.lan` {
+		t.Errorf("unexpected calls recorded: %+v", mock.Calls)
+	}
+}
+
+func TestHandleUbusList_Success(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Results: map[string]string{
+			`cmd ubus list network.interface.*`: "network.interface.lan\nnetwork.interface.wan\n",
+		},
+	}
+	mqttMock := mqttclient.NewMockMQTTClient()
+	a := newTestAgent(mqttMock, mock)
+
+	cmd := Command{
+		CmdID:   "test-cmd-ubus-list-1",
+		Type:    "ubus_list",
+		Payload: []byte(`{"path":"network.interface.*"}`),
+	}
+	a.handleUbusList(cmd)
+
+	if len(mqttMock.Published) == 0 {
+		t.Fatal("expected ACK to be published")
+	}
+	lastMsg := mqttMock.Published[len(mqttMock.Published)-1]
+
+	var ack struct {
+		CmdID  string `json:"cmd_id"`
+		Status string `json:"status"`
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(lastMsg.Payload, &ack); err != nil {
+		t.Fatalf("unmarshal ack: %v", err)
+	}
+	if ack.CmdID != "test-cmd-ubus-list-1" {
+		t.Errorf("cmd_id = %q, want %q", ack.CmdID, "test-cmd-ubus-list-1")
+	}
+	if ack.Status != "ok" {
+		t.Errorf("status = %q, want ok", ack.Status)
+	}
+	if ack.Output != "network.interface.lan\nnetwork.interface.wan\n" {
+		t.Errorf("output = %q, want raw passthrough of ubus list output", ack.Output)
+	}
+}
+
+func TestHandleUbusList_Verbose(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Results: map[string]string{
+			`cmd ubus -v list system`: `'system' @651f206c` + "\n" + `"board":{}` + "\n",
+		},
+	}
+	mqttMock := mqttclient.NewMockMQTTClient()
+	a := newTestAgent(mqttMock, mock)
+
+	a.handleUbusList(Command{
+		CmdID:   "test-cmd-ubus-list-2",
+		Type:    "ubus_list",
+		Payload: []byte(`{"path":"system","verbose":true}`),
+	})
+
+	lastMsg := mqttMock.Published[len(mqttMock.Published)-1]
+	var ack struct {
+		Status string `json:"status"`
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(lastMsg.Payload, &ack); err != nil {
+		t.Fatalf("unmarshal ack: %v", err)
+	}
+	if ack.Status != "ok" {
+		t.Errorf("status = %q, want ok", ack.Status)
+	}
+	if ack.Output == "" {
+		t.Error("expected non-empty verbose output")
+	}
+}
+
+func TestHandleUbusList_NoPathListsEverything(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Results: map[string]string{
+			`cmd ubus list`: "dhcp\ndnsmasq\nnetwork\nsystem\nuci\n",
+		},
+	}
+	mqttMock := mqttclient.NewMockMQTTClient()
+	a := newTestAgent(mqttMock, mock)
+
+	a.handleUbusList(Command{CmdID: "test-cmd-ubus-list-3", Type: "ubus_list", Payload: []byte(`{}`)})
+
+	lastMsg := mqttMock.Published[len(mqttMock.Published)-1]
+	var ack struct {
+		Status string `json:"status"`
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(lastMsg.Payload, &ack); err != nil {
+		t.Fatalf("unmarshal ack: %v", err)
+	}
+	if ack.Status != "ok" {
+		t.Errorf("status = %q, want ok", ack.Status)
+	}
+	if ack.Output != "dhcp\ndnsmasq\nnetwork\nsystem\nuci\n" {
+		t.Errorf("output = %q", ack.Output)
+	}
+}
+
+func TestHandleUbusList_UbusFailure(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Errors: map[string]error{
+			`cmd ubus list bogus.*`: &mockExecError{"ubus: not found"},
+		},
+	}
+	mqttMock := mqttclient.NewMockMQTTClient()
+	a := newTestAgent(mqttMock, mock)
+
+	a.handleUbusList(Command{CmdID: "test-cmd-ubus-list-4", Type: "ubus_list", Payload: []byte(`{"path":"bogus.*"}`)})
+
+	lastMsg := mqttMock.Published[len(mqttMock.Published)-1]
+	var ack struct {
+		Status string `json:"status"`
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(lastMsg.Payload, &ack); err != nil {
+		t.Fatalf("unmarshal ack: %v", err)
+	}
+	if ack.Status != "error" {
+		t.Errorf("status = %q, want error", ack.Status)
+	}
+	if ack.Output == "" {
+		t.Error("expected non-empty output/error text on ubus failure")
+	}
+}
+
+func TestHandleUbusList_InvalidPathRejectedWithoutExec(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{"space in path", `{"path":"foo bar"}`},
+		{"semicolon in path", `{"path":"foo;rm -rf /"}`},
+		{"quote in path", `{"path":"foo\"bar"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &uci.MockUCIRunner{}
+			mqttMock := mqttclient.NewMockMQTTClient()
+			a := newTestAgent(mqttMock, mock)
+
+			a.handleUbusList(Command{CmdID: "test-cmd-ubus-list-invalid", Type: "ubus_list", Payload: []byte(tt.payload)})
+
+			if len(mock.Calls) != 0 {
+				t.Errorf("expected no ExecCmd calls for invalid input, got %+v", mock.Calls)
+			}
+
+			lastMsg := mqttMock.Published[len(mqttMock.Published)-1]
+			var ack struct {
+				Status string `json:"status"`
+			}
+			if err := json.Unmarshal(lastMsg.Payload, &ack); err != nil {
+				t.Fatalf("unmarshal ack: %v", err)
+			}
+			if ack.Status != "error" {
+				t.Errorf("status = %q, want error", ack.Status)
+			}
+		})
+	}
+}
+
+func TestHandleUbusList_InvalidPayloadRejectedWithoutExec(t *testing.T) {
+	mock := &uci.MockUCIRunner{}
+	mqttMock := mqttclient.NewMockMQTTClient()
+	a := newTestAgent(mqttMock, mock)
+
+	a.handleUbusList(Command{CmdID: "test-cmd-ubus-list-badjson", Type: "ubus_list", Payload: []byte(`not-json`)})
+
+	if len(mock.Calls) != 0 {
+		t.Errorf("expected no ExecCmd calls for undecodable payload, got %+v", mock.Calls)
+	}
+	lastMsg := mqttMock.Published[len(mqttMock.Published)-1]
+	var ack struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(lastMsg.Payload, &ack); err != nil {
+		t.Fatalf("unmarshal ack: %v", err)
+	}
+	if ack.Status != "error" {
+		t.Errorf("status = %q, want error", ack.Status)
+	}
+}
+
+func TestPublishInfo_CapabilitiesContainUbusList(t *testing.T) {
+	mqttMock := mqttclient.NewMockMQTTClient()
+	a := newTestAgent(mqttMock, &uci.MockUCIRunner{})
+
+	if err := a.publishInfo(context.Background()); err != nil {
+		t.Fatalf("publishInfo: %v", err)
+	}
+
+	var info InfoPayload
+	if err := json.Unmarshal(mqttMock.Published[0].Payload, &info); err != nil {
+		t.Fatalf("unmarshal info: %v", err)
+	}
+	found := false
+	for _, c := range info.Capabilities {
+		if c == "ubus_list" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected capabilities to contain ubus_list, got %+v", info.Capabilities)
+	}
+}
+
 func TestPublishInfo_CapabilitiesContainUbusCall(t *testing.T) {
 	mqttMock := mqttclient.NewMockMQTTClient()
 	a := newTestAgent(mqttMock, &uci.MockUCIRunner{})
