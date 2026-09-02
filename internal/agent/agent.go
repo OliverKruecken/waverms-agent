@@ -215,10 +215,10 @@ type InfoPayload struct {
 // hostKeyFingerprints returns a map of filename → lowercase hex SHA-256 for each
 // allowed host key file that currently exists in dir. Files that cannot be read
 // (missing or permission error) are silently omitted.
-func hostKeyFingerprints(allowedNames map[string]bool, dir string) map[string]string {
+func hostKeyFingerprints(fw filewriter.FileAccess, allowedNames map[string]bool, dir string) map[string]string {
 	out := make(map[string]string, len(allowedNames))
 	for name := range allowedNames {
-		data, err := os.ReadFile(filepath.Join(dir, name))
+		data, err := fw.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			continue
 		}
@@ -342,33 +342,35 @@ var supportedCapabilities = []string{
 // fallbackStatePackages is used only when /etc/config cannot be read.
 var fallbackStatePackages = []string{"system", "network", "wireless", "firewall", "dhcp"}
 
-// packageNameRe matches valid UCI package names: alphanumeric, dash, underscore.
-// This excludes opkg/apk artifact files that land in /etc/config (e.g. "usteer.apk-new",
-// "dropbear-opkg", "network.orig", "firewall~") which are not real UCI packages and make
-// "uci export" fail.
-var packageNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+// safeIdentifierRe matches a safe on-disk identifier: alphanumeric, dash,
+// underscore. Shared by discoverPackages (UCI package names — excludes
+// opkg/apk artifact files that land in /etc/config, e.g. "usteer.apk-new",
+// "dropbear-opkg", "network.orig", "firewall~", which aren't real UCI
+// packages and make "uci export" fail), discoverServices, and
+// handleServiceApply (init.d service names).
+var safeIdentifierRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // discoverPackages lists all regular files in configDir and returns them as
 // UCI package names. Falls back to fallbackStatePackages on any read error.
-func discoverPackages(configDir string) []string {
-	entries, err := os.ReadDir(configDir)
+func discoverPackages(fw filewriter.FileAccess, configDir string) []string {
+	entries, err := fw.ListDir(configDir)
 	if err != nil {
 		return fallbackStatePackages
 	}
 	pkgs := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if e.Type().IsRegular() {
-			if !packageNameRe.MatchString(e.Name()) {
-				slog.Debug("discoverPackages: skipping non-package file in /etc/config", "name", e.Name())
+		if e.IsRegular {
+			if !safeIdentifierRe.MatchString(e.Name) {
+				slog.Debug("discoverPackages: skipping non-package file in /etc/config", "name", e.Name)
 				continue
 			}
-			pkgs = append(pkgs, e.Name())
-		} else if e.Type()&os.ModeSymlink != 0 {
+			pkgs = append(pkgs, e.Name)
+		} else if e.IsSymlink {
 			// Some OpenWrt setups symlink UCI packages into /etc/config/.
-			// We skip symlinks because os.ReadDir does not follow them and
-			// resolving them safely would require extra stat calls. Log at
-			// debug so operators can spot unexpected symlinks.
-			slog.Debug("discoverPackages: skipping symlink in /etc/config", "name", e.Name())
+			// We skip symlinks because resolving them safely would require
+			// extra stat calls. Log at debug so operators can spot unexpected
+			// symlinks.
+			slog.Debug("discoverPackages: skipping symlink in /etc/config", "name", e.Name)
 		}
 	}
 	if len(pkgs) == 0 {
@@ -377,24 +379,21 @@ func discoverPackages(configDir string) []string {
 	return pkgs
 }
 
-// serviceNameRe matches valid OpenWrt init.d service names: alphanumeric, dash, underscore.
-var serviceNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-
 // discoverServices scans initdDir for service scripts and returns their enabled/running state.
 // Best-effort: entries that cannot be checked are skipped silently.
-func discoverServices(runner uci.UCIRunner, initdDir string) []ServiceInfo {
-	entries, err := os.ReadDir(initdDir)
+func discoverServices(fw filewriter.FileAccess, runner uci.UCIRunner, initdDir string) []ServiceInfo {
+	entries, err := fw.ListDir(initdDir)
 	if err != nil {
 		slog.Debug("discoverServices: cannot read initd dir", "dir", initdDir, "err", err)
 		return nil
 	}
 	var services []ServiceInfo
 	for _, e := range entries {
-		if !e.Type().IsRegular() && e.Type()&os.ModeSymlink == 0 {
+		if !e.IsRegular && !e.IsSymlink {
 			continue
 		}
-		name := e.Name()
-		if !serviceNameRe.MatchString(name) {
+		name := e.Name
+		if !safeIdentifierRe.MatchString(name) {
 			continue
 		}
 		script := initdDir + "/" + name
@@ -608,7 +607,7 @@ func New(opts *Options) *Agent {
 
 	fw := opts.FileAccess
 	if fw == nil {
-		fw = &filewriter.OSFileAccess{}
+		fw = &filewriter.OSFileAccess{UCI: opts.UCI}
 	}
 	ps := opts.PasswordSetter
 	if ps == nil {
@@ -1100,7 +1099,7 @@ func (a *Agent) publishInfo(ctx context.Context) error {
 	slog.Debug("publishing heartbeat", "hostname", hostname, "uptime_seconds", uptime)
 
 	caps := append(supportedCapabilities, "ssh_daemon:"+a.sshDaemon.Name)
-	services := discoverServices(a.uci, a.initdDir)
+	services := discoverServices(a.fileAccess, a.uci, a.initdDir)
 	info := InfoPayload{
 		DeviceID:       a.creds.DeviceID,
 		Hostname:       hostname,
@@ -1204,6 +1203,27 @@ func (a *Agent) publishAckPayload(cmdID string, ack AckPayload) {
 	slog.Error("publish ack failed, giving up", "cmd_id", cmdID, "attempts", ackPublishAttempts, "err", err)
 }
 
+// publishTypedAck marshals ack (a command-specific ack payload type — e.g.
+// ubus_call's/shell_exec's/file_transfer's/logs_fetch's own wire shape) and
+// publishes it once to device/{id}/ack. Shared tail for every ack type that
+// needs its own dedicated shape beyond AckPayload's generic
+// {cmd_id,status,output,timestamp}; unlike publishAckPayload above, this does
+// not retry — those four ack types never have, and preserving that here
+// keeps this purely a dedup of the marshal+publish+log boilerplate, not a
+// behavior change.
+func publishTypedAck[T any](a *Agent, cmdID string, ack T) {
+	payload, err := json.Marshal(ack)
+	if err != nil {
+		slog.Error("marshal ack", "cmd_id", cmdID, "err", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := a.mqtt.Publish(ctx, mqttclient.TopicAck(a.creds.DeviceID), payload, 1, false); err != nil {
+		slog.Error("publish ack", "cmd_id", cmdID, "err", err)
+	}
+}
+
 // handleInfoRequest processes an incoming info/request message by publishing a fresh heartbeat.
 func (a *Agent) handleInfoRequest(_ string, _ []byte) {
 	slog.Debug("info request received — publishing fresh heartbeat")
@@ -1276,7 +1296,7 @@ func (a *Agent) handleLogLevelControl(_ string, payload []byte) {
 // Packages that fail to export are skipped and logged.
 func (a *Agent) publishState(ctx context.Context, trigger string, pkgs []string) error {
 	if len(pkgs) == 0 {
-		pkgs = discoverPackages("/etc/config")
+		pkgs = discoverPackages(a.fileAccess, "/etc/config")
 	}
 	slog.Debug("publishing state", "trigger", trigger, "packages", pkgs)
 
@@ -1292,7 +1312,7 @@ func (a *Agent) publishState(ctx context.Context, trigger string, pkgs []string)
 		if len(sections) > 0 {
 			packages[pkg] = sections
 		}
-		if raw, readErr := os.ReadFile("/etc/config/" + pkg); readErr == nil {
+		if raw, readErr := a.fileAccess.ReadFile("/etc/config/" + pkg); readErr == nil {
 			rawFiles[pkg] = string(raw)
 		}
 	}
@@ -1303,7 +1323,7 @@ func (a *Agent) publishState(ctx context.Context, trigger string, pkgs []string)
 		Packages:            packages,
 		RawFiles:            rawFiles,
 		AuthorizedKeys:      installedAuthorizedKeys(a.fileAccess),
-		HostKeyFingerprints: hostKeyFingerprints(allowedHostKeyFilenamesByDaemon[a.sshDaemon.Name], a.sshDaemon.Dir),
+		HostKeyFingerprints: hostKeyFingerprints(a.fileAccess, allowedHostKeyFilenamesByDaemon[a.sshDaemon.Name], a.sshDaemon.Dir),
 		TLSCertFingerprint:  a.tlsCertFingerprint(),
 		PasswordHash:        a.rootPasswordHash(),
 	}

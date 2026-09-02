@@ -57,7 +57,7 @@ func (a *Agent) handleUCISet(cmd Command) {
 			continue
 		}
 		slog.Debug("uci exec", "args", args)
-		out, err := a.uci.ExecRaw(args...)
+		out, err := runUCISetCommand(a.uci, args[0], args[1:])
 		if out != "" {
 			output.WriteString(out)
 			output.WriteString("\n")
@@ -222,13 +222,20 @@ func (a *Agent) handleHostKeyRemove(cmd Command) {
 	removed := 0
 	for name := range allowedHostKeyFilenamesByDaemon[a.sshDaemon.Name] {
 		path := a.sshDaemon.Dir + name
-		err := os.Remove(path)
-		if err != nil && !os.IsNotExist(err) {
-			slog.Warn("host_key_remove: could not remove file", "cmd_id", cmd.CmdID, "path", path, "err", err)
-		} else if err == nil {
-			slog.Debug("host_key_remove: removed key file", "path", path)
-			removed++
+		// ubus's file.remove already treats a missing path as success, so —
+		// unlike the previous os.Remove-based version — there's no error to
+		// distinguish "didn't exist" from "removal failed"; check existence
+		// first so the removed count still reflects files that genuinely
+		// existed, same as before.
+		if !a.fileAccess.Exists(path) {
+			continue
 		}
+		if err := a.fileAccess.Remove(path); err != nil {
+			slog.Warn("host_key_remove: could not remove file", "cmd_id", cmd.CmdID, "path", path, "err", err)
+			continue
+		}
+		slog.Debug("host_key_remove: removed key file", "path", path)
+		removed++
 	}
 	if _, err := a.uci.ExecCmd(a.sshDaemon.Service, "restart"); err != nil {
 		// Non-fatal: keys are already gone; the daemon will regenerate on next start.
@@ -365,7 +372,10 @@ func (a *Agent) handleTlsCertRemove(cmd Command) {
 	}
 
 	for _, path := range []string{certPath, keyPath} {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		// ubus's file.remove already treats a missing path as success, so —
+		// unlike the previous os.Remove-based version — any error here is a
+		// genuine failure, not "didn't exist."
+		if err := a.fileAccess.Remove(path); err != nil {
 			slog.Warn("tls_cert_remove: could not remove file", "cmd_id", cmd.CmdID, "path", path, "err", err)
 		}
 	}
@@ -394,13 +404,13 @@ func (a *Agent) handleServiceApply(cmd Command) {
 
 	var errs []string
 	for name, enable := range p.Services {
-		if !serviceNameRe.MatchString(name) || len(name) > 64 {
+		if !safeIdentifierRe.MatchString(name) || len(name) > 64 {
 			slog.Warn("service_apply: invalid service name, skipping", "cmd_id", cmd.CmdID, "name", name)
 			errs = append(errs, fmt.Sprintf("%s: invalid name", name))
 			continue
 		}
 		script := filepath.Join(a.initdDir, name)
-		if _, err := os.Stat(script); err != nil {
+		if !a.fileAccess.Exists(script) {
 			slog.Warn("service_apply: service not found, skipping", "cmd_id", cmd.CmdID, "name", name)
 			errs = append(errs, fmt.Sprintf("%s: not found", name))
 			continue

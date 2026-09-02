@@ -1,13 +1,10 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
-
-	mqttclient "github.com/OliverKruecken/waverms-agent/internal/mqtt"
 )
 
 // LogEntry is one parsed ubus logd record. Field names/types match logd's
@@ -105,21 +102,11 @@ func (a *Agent) publishAckLogsFetch(cmdID, status, output string, entries []LogE
 		Timestamp  string     `json:"timestamp"`
 		LogEntries []LogEntry `json:"log_entries,omitempty"`
 	}
-	ack := logsFetchAckPayload{
+	publishTypedAck(a, cmdID, logsFetchAckPayload{
 		CmdID:      cmdID,
 		Status:     status,
 		Output:     output,
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 		LogEntries: entries,
-	}
-	payload, err := json.Marshal(ack)
-	if err != nil {
-		slog.Error("marshal logs_fetch ack", "err", err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := a.mqtt.Publish(ctx, mqttclient.TopicAck(a.creds.DeviceID), payload, 1, false); err != nil {
-		slog.Error("publish logs_fetch ack", "cmd_id", cmdID, "err", err)
-	}
+	})
 }

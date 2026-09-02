@@ -1,13 +1,11 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 	"regexp"
 	"time"
 
-	mqttclient "github.com/OliverKruecken/waverms-agent/internal/mqtt"
 	"github.com/OliverKruecken/waverms-agent/internal/uci"
 )
 
@@ -145,21 +143,11 @@ func (a *Agent) publishAckUbusCall(cmdID, status, output string, result json.Raw
 		Timestamp string          `json:"timestamp"`
 		Result    json.RawMessage `json:"result,omitempty"`
 	}
-	ack := ubusCallAckPayload{
+	publishTypedAck(a, cmdID, ubusCallAckPayload{
 		CmdID:     cmdID,
 		Status:    status,
 		Output:    output,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Result:    result,
-	}
-	payload, err := json.Marshal(ack)
-	if err != nil {
-		slog.Error("marshal ubus_call ack", "err", err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := a.mqtt.Publish(ctx, mqttclient.TopicAck(a.creds.DeviceID), payload, 1, false); err != nil {
-		slog.Error("publish ubus_call ack", "cmd_id", cmdID, "err", err)
-	}
+	})
 }

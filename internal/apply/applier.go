@@ -170,24 +170,26 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 	return nil
 }
 
-// findSectionByName returns the existing named section with the given name, or nil.
-func findSectionByName(sections []uci.Section, name string) *uci.Section {
-	for i := range sections {
-		if !sections[i].Anonymous && sections[i].Name == name {
-			return &sections[i]
+// findFirst returns a pointer to the first element of items matching pred, or
+// nil. Shared by findSectionByName/findSectionByID below — mirrors the
+// generic registry helpers in internal/agent/stopregistry.go.
+func findFirst[T any](items []T, pred func(T) bool) *T {
+	for i := range items {
+		if pred(items[i]) {
+			return &items[i]
 		}
 	}
 	return nil
 }
 
+// findSectionByName returns the existing named section with the given name, or nil.
+func findSectionByName(sections []uci.Section, name string) *uci.Section {
+	return findFirst(sections, func(s uci.Section) bool { return !s.Anonymous && s.Name == name })
+}
+
 // findSectionByID returns the existing section with the given id, or nil.
 func findSectionByID(sections []uci.Section, id string) *uci.Section {
-	for i := range sections {
-		if sections[i].ID == id {
-			return &sections[i]
-		}
-	}
-	return nil
+	return findFirst(sections, func(s uci.Section) bool { return s.ID == id })
 }
 
 // existingSectionTypes returns the distinct section types currently present

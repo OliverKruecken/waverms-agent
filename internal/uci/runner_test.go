@@ -111,24 +111,6 @@ func TestMockUCIRunner_RetypeExisting(t *testing.T) {
 	assert.Contains(t, m.Calls, "set-type network.wan=interface")
 }
 
-func TestMockUCIRunner_ExecRaw(t *testing.T) {
-	m := &MockUCIRunner{}
-	_, err := m.ExecRaw("set", "system.@system[0].hostname=router-01")
-	assert.NoError(t, err)
-	assert.Contains(t, m.Calls, "raw set system.@system[0].hostname=router-01")
-}
-
-func TestMockUCIRunner_ExecRaw_ErrorInjection(t *testing.T) {
-	injected := errors.New("exec failed")
-	m := &MockUCIRunner{
-		Errors: map[string]error{
-			"raw set system.@system[0].hostname=router-01": injected,
-		},
-	}
-	_, err := m.ExecRaw("set", "system.@system[0].hostname=router-01")
-	assert.ErrorIs(t, err, injected)
-}
-
 func TestMockUCIRunner_RecordsMultipleCalls(t *testing.T) {
 	m := &MockUCIRunner{}
 	_ = m.SetValues("network", "wan", map[string]interface{}{"proto": "dhcp"})

@@ -13,11 +13,19 @@ type WriteCall struct {
 // ReadFiles maps path → content for ReadFile responses.
 // ReadErrors maps path → error for ReadFile error injection.
 // Errors maps path → error for WriteFile error injection.
+// RemoveErrors maps path → error for Remove error injection.
+// ExistsPaths maps path → return value for Exists (absent path defaults to false).
+// ListDirs maps path → entries for ListDir responses; ListDirErrors maps path → error.
 type MockFileAccess struct {
-	Calls      []WriteCall
-	Errors     map[string]error
-	ReadFiles  map[string][]byte
-	ReadErrors map[string]error
+	Calls         []WriteCall
+	Errors        map[string]error
+	ReadFiles     map[string][]byte
+	ReadErrors    map[string]error
+	RemoveCalls   []string
+	RemoveErrors  map[string]error
+	ExistsPaths   map[string]bool
+	ListDirs      map[string][]DirEntry
+	ListDirErrors map[string]error
 }
 
 // WriteFile records the call and returns any injected error for path.
@@ -44,4 +52,34 @@ func (m *MockFileAccess) ReadFile(path string) ([]byte, error) {
 		}
 	}
 	return nil, os.ErrNotExist
+}
+
+// Remove records the call and returns any injected error for path. Matches
+// OSFileAccess's "missing path is success" contract by default.
+func (m *MockFileAccess) Remove(path string) error {
+	m.RemoveCalls = append(m.RemoveCalls, path)
+	if m.RemoveErrors != nil {
+		if err, ok := m.RemoveErrors[path]; ok {
+			return err
+		}
+	}
+	return nil
+}
+
+// Exists returns the injected value for path, or false if not configured.
+func (m *MockFileAccess) Exists(path string) bool {
+	if m.ExistsPaths == nil {
+		return false
+	}
+	return m.ExistsPaths[path]
+}
+
+// ListDir returns the injected entries for path, or an empty list if not configured.
+func (m *MockFileAccess) ListDir(path string) ([]DirEntry, error) {
+	if m.ListDirErrors != nil {
+		if err, ok := m.ListDirErrors[path]; ok {
+			return nil, err
+		}
+	}
+	return m.ListDirs[path], nil
 }

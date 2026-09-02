@@ -27,10 +27,7 @@ var (
 // "legacy:<event>" key otherwise, preserving the original dedup-by-event
 // contract exactly.
 func makeListenKey(watchID, event string) string {
-	if watchID != "" {
-		return watchID
-	}
-	return "legacy:" + event
+	return resolveKey[string](watchID, "legacy:"+event)
 }
 
 // UbusListenPayload is the inner payload for type "ubus_listen": start (or

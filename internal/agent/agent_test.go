@@ -435,7 +435,13 @@ func TestPublishInfo_IncludesSSHDaemonCapability(t *testing.T) {
 
 func TestHandleCommand_UCISet_ExecutesAndAcks(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
-	uciMock := &uci.MockUCIRunner{}
+	uciMock := &uci.MockUCIRunner{
+		// One anonymous "system"-type section, so "@system[0]" positional
+		// addressing resolves to it.
+		Sections: map[string][]uci.Section{
+			"system": {{ID: "cfg01", Type: "system", Anonymous: true, Options: map[string]interface{}{}}},
+		},
+	}
 	a := newTestAgent(mock, uciMock)
 
 	payload := `{
@@ -446,9 +452,13 @@ func TestHandleCommand_UCISet_ExecutesAndAcks(t *testing.T) {
 
 	a.handleCommand("device/test-device-uuid/cmd", []byte(payload))
 
-	// UCI must have been called
-	assert.Contains(t, uciMock.Calls, "raw set system.@system[0].hostname=router-01")
-	assert.Contains(t, uciMock.Calls, "raw commit system")
+	// UCI must have been called: the resolved "@system[0]" -> "cfg01", then commit.
+	assert.Contains(t, uciMock.Calls, "setvalues system.cfg01")
+	require.Len(t, uciMock.SetValuesCalls, 1)
+	assert.Equal(t, "system", uciMock.SetValuesCalls[0].Pkg)
+	assert.Equal(t, "cfg01", uciMock.SetValuesCalls[0].Section)
+	assert.Equal(t, map[string]interface{}{"hostname": "router-01"}, uciMock.SetValuesCalls[0].Values)
+	assert.Contains(t, uciMock.Calls, "commit system")
 
 	// Ack must be published
 	require.Len(t, mock.Published, 1)
@@ -464,7 +474,7 @@ func TestHandleCommand_UCISet_ErrorReflectedInAck(t *testing.T) {
 	mock := mqttclient.NewMockMQTTClient()
 	uciMock := &uci.MockUCIRunner{
 		Errors: map[string]error{
-			"raw commit system": assert.AnError,
+			"commit system": assert.AnError,
 		},
 	}
 	a := newTestAgent(mock, uciMock)
@@ -911,7 +921,7 @@ func TestHandleCommand_UCISet_BlockedSubcommand_AcksError(t *testing.T) {
 			a.handleCommand("device/test-device-uuid/cmd", []byte(payload))
 
 			// UCI runner must NOT have been called.
-			assert.Empty(t, uciMock.Calls, "ExecRaw must not be called for blocked subcommand %q", sub)
+			assert.Empty(t, uciMock.Calls, "uci runner must not be called for blocked subcommand %q", sub)
 
 			// Ack must be "error".
 			require.Len(t, mock.Published, 1)
@@ -924,24 +934,39 @@ func TestHandleCommand_UCISet_BlockedSubcommand_AcksError(t *testing.T) {
 }
 
 func TestHandleCommand_UCISet_AllowedSubcommands_AreExecuted(t *testing.T) {
-	allowed := []string{"set", "commit", "revert", "delete", "add", "add_list", "del_list", "get"}
-	for _, sub := range allowed {
-		t.Run(sub, func(t *testing.T) {
+	cases := []struct {
+		sub          string
+		command      string
+		expectedCall string
+	}{
+		{"set", "set network.lan.proto=static", "setvalues network.lan"},
+		{"commit", "commit network", "commit network"},
+		{"revert", "revert network", "revert network"},
+		{"delete", "delete network.lan.proto", "deleteoptions network.lan [proto]"},
+		{"add", "add network interface", "add network interface"},
+		{"add_list", "add_list network.lan.dns=8.8.8.8", "setvalues network.lan"},
+		{"del_list", "del_list network.lan.dns=8.8.8.8", "deleteoptions network.lan [dns]"},
+		{"get", "get network.lan", "sections network"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sub, func(t *testing.T) {
 			mock := mqttclient.NewMockMQTTClient()
-			uciMock := &uci.MockUCIRunner{}
+			uciMock := &uci.MockUCIRunner{
+				Sections: map[string][]uci.Section{
+					"network": {{ID: "lan", Type: "interface", Name: "lan", Options: map[string]interface{}{"proto": "dhcp"}}},
+				},
+			}
 			a := newTestAgent(mock, uciMock)
 
-			// Use "uci <sub> system" for each allowed subcommand.
-			payload := `{"cmd_id":"uci-allow","type":"uci_set","payload":{"commands":["uci ` + sub + ` system"]}}`
+			payload := `{"cmd_id":"uci-allow","type":"uci_set","payload":{"commands":["uci ` + tc.command + `"]}}`
 			a.handleCommand("device/test-device-uuid/cmd", []byte(payload))
 
-			// ExecRaw must have been called with the subcommand.
-			assert.Contains(t, uciMock.Calls, "raw "+sub+" system")
+			assert.Contains(t, uciMock.Calls, tc.expectedCall)
 
 			require.Len(t, mock.Published, 1)
 			var ack AckPayload
 			require.NoError(t, json.Unmarshal(mock.Published[0].Payload, &ack))
-			assert.Equal(t, "ok", ack.Status)
+			assert.Equal(t, "ok", ack.Status, "output: %s", ack.Output)
 		})
 	}
 }
@@ -958,7 +983,9 @@ func TestHandleCommand_StripUCIPrefix(t *testing.T) {
 	}`
 	a.handleCommand("device/test-device-uuid/cmd", []byte(payload))
 
-	assert.Contains(t, uciMock.Calls, "raw set network.wan.proto=dhcp")
+	assert.Contains(t, uciMock.Calls, "setvalues network.wan")
+	require.Len(t, uciMock.SetValuesCalls, 1)
+	assert.Equal(t, map[string]interface{}{"proto": "dhcp"}, uciMock.SetValuesCalls[0].Values)
 }
 
 // systemUCISections is the minimal on-device "system" package state used by
@@ -2105,9 +2132,11 @@ func TestPublishInfo_CapabilitiesContainTlsCertRemove(t *testing.T) {
 func TestHostKeyFingerprints_ReturnsHexSHA256ForExistingFile(t *testing.T) {
 	dir := t.TempDir()
 	content := []byte("fake-ed25519-key-content")
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "dropbear_ed25519_host_key"), content, 0600))
+	fw := &filewriter.MockFileAccess{ReadFiles: map[string][]byte{
+		filepath.Join(dir, "dropbear_ed25519_host_key"): content,
+	}}
 
-	fps := hostKeyFingerprints(map[string]bool{"dropbear_ed25519_host_key": true}, dir)
+	fps := hostKeyFingerprints(fw, map[string]bool{"dropbear_ed25519_host_key": true}, dir)
 
 	require.Len(t, fps, 1)
 	sum := sha256.Sum256(content)
@@ -2117,9 +2146,11 @@ func TestHostKeyFingerprints_ReturnsHexSHA256ForExistingFile(t *testing.T) {
 func TestHostKeyFingerprints_OmitsMissingFiles(t *testing.T) {
 	dir := t.TempDir()
 	// Only ed25519 key exists; rsa is absent.
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "dropbear_ed25519_host_key"), []byte("ed25519"), 0600))
+	fw := &filewriter.MockFileAccess{ReadFiles: map[string][]byte{
+		filepath.Join(dir, "dropbear_ed25519_host_key"): []byte("ed25519"),
+	}}
 
-	fps := hostKeyFingerprints(map[string]bool{
+	fps := hostKeyFingerprints(fw, map[string]bool{
 		"dropbear_ed25519_host_key": true,
 		"dropbear_rsa_host_key":     true,
 	}, dir)
@@ -2129,7 +2160,7 @@ func TestHostKeyFingerprints_OmitsMissingFiles(t *testing.T) {
 }
 
 func TestHostKeyFingerprints_ReturnsNilWhenNoFilesExist(t *testing.T) {
-	fps := hostKeyFingerprints(map[string]bool{"dropbear_ed25519_host_key": true}, t.TempDir())
+	fps := hostKeyFingerprints(&filewriter.MockFileAccess{}, map[string]bool{"dropbear_ed25519_host_key": true}, t.TempDir())
 	assert.Nil(t, fps)
 }
 
@@ -2255,7 +2286,7 @@ func TestDiscoverPackages_SkipsOpkgApkArtifactFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("config foo"), 0o644))
 	}
 
-	pkgs := discoverPackages(dir)
+	pkgs := discoverPackages(fileAccessForDir(dir), dir)
 
 	assert.ElementsMatch(t, []string{"usteer", "usteer-ng", "network"}, pkgs)
 }
@@ -2264,13 +2295,16 @@ func TestDiscoverPackages_FallsBackWhenOnlyArtifactFilesPresent(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "usteer.apk-new"), []byte("config foo"), 0o644))
 
-	pkgs := discoverPackages(dir)
+	pkgs := discoverPackages(fileAccessForDir(dir), dir)
 
 	assert.Equal(t, fallbackStatePackages, pkgs)
 }
 
 func TestDiscoverPackages_FallsBackOnUnreadableDir(t *testing.T) {
-	pkgs := discoverPackages(filepath.Join(t.TempDir(), "does-not-exist"))
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	pkgs := discoverPackages(&filewriter.MockFileAccess{
+		ListDirErrors: map[string]error{missing: os.ErrNotExist},
+	}, missing)
 
 	assert.Equal(t, fallbackStatePackages, pkgs)
 }

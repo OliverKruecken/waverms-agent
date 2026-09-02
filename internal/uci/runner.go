@@ -50,20 +50,20 @@ type UCIRunner interface {
 	// needed for the rare case of a named section that already exists under
 	// the wrong type; the common create/update paths never call it.
 	RetypeExisting(pkg, sectionID, sectionType string) error
-	// ExecRaw runs the uci CLI with arbitrary args (for ad-hoc commands from server).
-	ExecRaw(args ...string) (string, error)
 	// ExecCmd runs an arbitrary executable directly (not via uci), e.g. an init script.
 	ExecCmd(path string, args ...string) (string, error)
 	// ExecShell runs command through /bin/sh -c, capturing combined stdout+stderr, bounded by
-	// timeout. Unlike ExecCmd/ExecRaw, this genuinely invokes a shell — pipes, redirects, and
+	// timeout. Unlike ExecCmd, this genuinely invokes a shell — pipes, redirects, and
 	// multi-statement scripts all work as a real script would. The returned exitCode reflects the
 	// process's actual exit status even when non-zero (that's a legitimate result, not a failure);
 	// err is only set for exec-level failures (command not found, timeout, kill).
 	ExecShell(command string, timeout time.Duration) (output string, exitCode int, err error)
 }
 
-// RealUCIRunner calls the uci CLI (RetypeExisting/ExecRaw/ExecCmd/ExecShell) and
-// rpcd's uci ubus object (everything else, via `ubus call uci <method> <json>`).
+// RealUCIRunner calls the uci CLI (RetypeExisting only) and rpcd's uci ubus
+// object (everything else, via `ubus call uci <method> <json>`); ExecCmd runs
+// an arbitrary executable directly (not via uci) and ExecShell runs a shell
+// script, neither of which touch the uci CLI at all.
 type RealUCIRunner struct{}
 
 // uciTimeout is the maximum time a single uci CLI call is allowed to run.
@@ -153,10 +153,6 @@ func (r *RealUCIRunner) Revert(pkg string) error {
 func (r *RealUCIRunner) RetypeExisting(pkg, sectionID, sectionType string) error {
 	_, err := run("set", fmt.Sprintf("%s.%s=%s", pkg, sectionID, sectionType))
 	return err
-}
-
-func (r *RealUCIRunner) ExecRaw(args ...string) (string, error) {
-	return run(args...)
 }
 
 func (r *RealUCIRunner) ExecCmd(path string, args ...string) (string, error) {
@@ -300,12 +296,6 @@ func (m *MockUCIRunner) RetypeExisting(pkg, sectionID, sectionType string) error
 	cmd := fmt.Sprintf("set-type %s.%s=%s", pkg, sectionID, sectionType)
 	m.record(cmd)
 	return m.err(cmd)
-}
-
-func (m *MockUCIRunner) ExecRaw(args ...string) (string, error) {
-	cmd := "raw " + strings.Join(args, " ")
-	m.record(cmd)
-	return "", m.err(cmd)
 }
 
 func (m *MockUCIRunner) ExecCmd(path string, args ...string) (string, error) {

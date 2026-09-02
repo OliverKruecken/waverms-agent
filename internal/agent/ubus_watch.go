@@ -31,10 +31,19 @@ type watchKey string
 // unwatch/push-correlation that's exact per registration instead of per ubus
 // target — see docs/plugins.md "Watch/listen ids".
 func makeWatchKey(watchID, object, method string) watchKey {
+	return resolveKey[watchKey](watchID, "legacy:"+object+"."+method)
+}
+
+// resolveKey resolves a standing-registration's registry key: watchID when
+// present, or legacyKey (the caller's synthetic fallback) otherwise. Shared
+// by makeWatchKey above and makeListenKey (ubus_listen.go) — the two differ
+// only in their key type (watchKey vs plain string, both ~string) and in how
+// they build their own legacyKey.
+func resolveKey[K ~string](watchID, legacyKey string) K {
 	if watchID != "" {
-		return watchKey(watchID)
+		return K(watchID)
 	}
-	return watchKey("legacy:" + object + "." + method)
+	return K(legacyKey)
 }
 
 // UbusWatchPayload is the inner payload for type "ubus_watch": start (or

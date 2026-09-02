@@ -1,12 +1,8 @@
 package agent
 
 import (
-	"context"
-	"encoding/json"
 	"log/slog"
 	"time"
-
-	mqttclient "github.com/OliverKruecken/waverms-agent/internal/mqtt"
 )
 
 // ShellExecPayload is the inner payload for type "shell_exec" — a generic, one-shot arbitrary
@@ -92,21 +88,11 @@ func (a *Agent) publishAckShellExec(cmdID, status, output string, exitCode int) 
 		ExitCode  int    `json:"exit_code"`
 		Timestamp string `json:"timestamp"`
 	}
-	ack := shellExecAckPayload{
+	publishTypedAck(a, cmdID, shellExecAckPayload{
 		CmdID:     cmdID,
 		Status:    status,
 		Output:    output,
 		ExitCode:  exitCode,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-	}
-	payload, err := json.Marshal(ack)
-	if err != nil {
-		slog.Error("marshal shell_exec ack", "err", err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := a.mqtt.Publish(ctx, mqttclient.TopicAck(a.creds.DeviceID), payload, 1, false); err != nil {
-		slog.Error("publish shell_exec ack", "cmd_id", cmdID, "err", err)
-	}
+	})
 }

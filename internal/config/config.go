@@ -144,6 +144,29 @@ func LoadWithOverlay(staticPath, dhcpPath string) (*Config, error) {
 // Overridden in tests to avoid slow sleeps.
 var brokerHostPollInterval = 5 * time.Second
 
+// pollUntil calls tryOnce every interval (clamped to whatever time remains
+// before timeout) until it reports success, returning timeoutErr() if the
+// deadline passes first. Shared by WaitForBrokerHost and
+// WaitForBootstrapToken, whose only difference beyond this loop is what
+// counts as "ready" and how the timeout error reads — timeout must be > 0;
+// each caller keeps its own zero-timeout ("try once, no wait") special case,
+// since those differ too (WaitForBrokerHost synthesizes a message,
+// WaitForBootstrapToken just returns ReadBootstrapToken's own error).
+func pollUntil[T any](timeout, interval time.Duration, tryOnce func() (T, bool), timeoutErr func() error) (T, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if v, ok := tryOnce(); ok {
+			return v, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			var zero T
+			return zero, timeoutErr()
+		}
+		time.Sleep(min(interval, remaining))
+	}
+}
+
 // WaitForBrokerHost polls LoadWithOverlay until cfg.BrokerHost is non-empty or
 // timeout elapses. Use this when broker_host may be delivered by a DHCP hook
 // (option 225) written after the agent starts. Zero timeout means one try with
@@ -165,17 +188,9 @@ func WaitForBrokerHost(staticPath, dhcpPath string, timeout time.Duration) (*Con
 		return cfg, nil
 	}
 
-	deadline := time.Now().Add(timeout)
-	for {
-		if cfg, ok := tryOnce(); ok {
-			return cfg, nil
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil, fmt.Errorf("BROKER_HOST not available in %s or %s after %v", staticPath, dhcpPath, timeout)
-		}
-		time.Sleep(min(brokerHostPollInterval, remaining))
-	}
+	return pollUntil(timeout, brokerHostPollInterval, tryOnce, func() error {
+		return fmt.Errorf("BROKER_HOST not available in %s or %s after %v", staticPath, dhcpPath, timeout)
+	})
 }
 
 // ReadBootstrapToken reads the one-line token file at path.
@@ -199,18 +214,11 @@ func WaitForBootstrapToken(path string, timeout time.Duration) (string, error) {
 	if timeout <= 0 {
 		return ReadBootstrapToken(path)
 	}
-	deadline := time.Now().Add(timeout)
-	for {
-		data, err := os.ReadFile(path)
-		if err == nil {
-			if tok := strings.TrimSpace(string(data)); tok != "" {
-				return tok, nil
-			}
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return "", fmt.Errorf("bootstrap token not found at %s after %v", path, timeout)
-		}
-		time.Sleep(min(bootstrapTokenPollInterval, remaining))
+	tryOnce := func() (string, bool) {
+		tok, err := ReadBootstrapToken(path)
+		return tok, err == nil && tok != ""
 	}
+	return pollUntil(timeout, bootstrapTokenPollInterval, tryOnce, func() error {
+		return fmt.Errorf("bootstrap token not found at %s after %v", path, timeout)
+	})
 }

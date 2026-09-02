@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,8 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
-
-	mqttclient "github.com/OliverKruecken/waverms-agent/internal/mqtt"
 )
 
 // FileTransferFile is one bundled file inside a "file_transfer" command payload — a signed,
@@ -207,22 +204,12 @@ func (a *Agent) publishAckFileTransfer(cmdID, status string, files []FileTransfe
 		Files     []FileTransferFileResult `json:"files"`
 		Timestamp string                   `json:"timestamp"`
 	}
-	ack := fileTransferAckPayload{
+	publishTypedAck(a, cmdID, fileTransferAckPayload{
 		CmdID:     cmdID,
 		Status:    status,
 		Files:     files,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-	}
-	payload, err := json.Marshal(ack)
-	if err != nil {
-		slog.Error("marshal file_transfer ack", "err", err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := a.mqtt.Publish(ctx, mqttclient.TopicAck(a.creds.DeviceID), payload, 1, false); err != nil {
-		slog.Error("publish file_transfer ack", "cmd_id", cmdID, "err", err)
-	}
+	})
 }
 
 // MockFileTransferDownloader records Download calls; per-call error controllable by URL so a

@@ -25,7 +25,7 @@ func newTestAgentWithInitd(mock *mqttclient.MockMQTTClient, uciMock *uci.MockUCI
 		MAC:        "aa:bb:cc:dd:ee:ff",
 		MQTT:       mock,
 		UCI:        uciMock,
-		FileAccess: &filewriter.MockFileAccess{},
+		FileAccess: fileAccessForDir(initdDir),
 		Version:    "1.0.0",
 		SSHDaemon:  &daemonDropbear,
 		InitdDir:   initdDir,
@@ -41,6 +41,33 @@ func makeInitdDir(t *testing.T, services []string) string {
 		f.Close()
 	}
 	return dir
+}
+
+// fileAccessForDir builds a MockFileAccess whose Exists/ListDir reflect the
+// real files present in dir at call time — service_apply tests create real
+// init.d script files via makeInitdDir/os.Create (handleServiceApply/
+// discoverServices now go through FileAccess rather than os.Stat/os.ReadDir
+// directly), so this bridges that real-filesystem test setup to the
+// mock-based production seam.
+func fileAccessForDir(dir string) *filewriter.MockFileAccess {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return &filewriter.MockFileAccess{}
+	}
+	exists := make(map[string]bool, len(entries))
+	dirEntries := make([]filewriter.DirEntry, 0, len(entries))
+	for _, e := range entries {
+		exists[filepath.Join(dir, e.Name())] = true
+		dirEntries = append(dirEntries, filewriter.DirEntry{
+			Name:      e.Name(),
+			IsRegular: e.Type().IsRegular(),
+			IsSymlink: e.Type()&os.ModeSymlink != 0,
+		})
+	}
+	return &filewriter.MockFileAccess{
+		ExistsPaths: exists,
+		ListDirs:    map[string][]filewriter.DirEntry{dir: dirEntries},
+	}
 }
 
 func TestHandleServiceApply_EnablesAndStartsService(t *testing.T) {
@@ -189,7 +216,7 @@ func TestDiscoverServices_ReturnsEnabledAndRunningState(t *testing.T) {
 		},
 	}
 
-	services := discoverServices(uciMock, initdDir)
+	services := discoverServices(fileAccessForDir(initdDir), uciMock, initdDir)
 
 	byName := make(map[string]ServiceInfo)
 	for _, s := range services {
@@ -213,7 +240,7 @@ func TestDiscoverServices_SkipsInvalidNames(t *testing.T) {
 	require.NoError(t, err)
 	f.Close()
 
-	services := discoverServices(&uci.MockUCIRunner{}, initdDir)
+	services := discoverServices(fileAccessForDir(initdDir), &uci.MockUCIRunner{}, initdDir)
 	for _, s := range services {
 		assert.NotEqual(t, ".hidden", s.Name)
 	}
@@ -221,6 +248,6 @@ func TestDiscoverServices_SkipsInvalidNames(t *testing.T) {
 
 func TestDiscoverServices_EmptyDir_ReturnsNil(t *testing.T) {
 	initdDir := t.TempDir()
-	services := discoverServices(&uci.MockUCIRunner{}, initdDir)
+	services := discoverServices(fileAccessForDir(initdDir), &uci.MockUCIRunner{}, initdDir)
 	assert.Nil(t, services)
 }
