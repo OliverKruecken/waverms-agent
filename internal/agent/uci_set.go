@@ -69,27 +69,13 @@ func resolveUCISection(sections []uci.Section, addr uciAddress) (string, error) 
 // findUCISection finds a section matching key by name (for a named section)
 // or by id (for an id, or a positionally-resolved reference) — uci addressing
 // allows either, e.g. "network.lan" (name) or "network.cfg01a2b3" (id).
-// Mirrors apply/applier.go's findSectionByName/findSectionByID, combined into
-// one lookup since uci_set doesn't know upfront which kind of key it has.
+// Combines uci.FindSectionByName/FindSectionByID into one lookup since
+// uci_set doesn't know upfront which kind of key it has.
 func findUCISection(sections []uci.Section, key string) *uci.Section {
-	if s := findFirst(sections, func(s uci.Section) bool { return !s.Anonymous && s.Name == key }); s != nil {
+	if s := uci.FindSectionByName(sections, key); s != nil {
 		return s
 	}
-	return findFirst(sections, func(s uci.Section) bool { return s.ID == key })
-}
-
-// findFirst returns a pointer to the first element of items matching pred, or
-// nil. Same small generic helper apply/applier.go defines for the same
-// purpose — kept as its own unexported copy here rather than exported from
-// apply, since internal/agent doesn't otherwise depend on internal/apply's
-// UCI-payload-staging package for anything this narrow.
-func findFirst[T any](items []T, pred func(T) bool) *T {
-	for i := range items {
-		if pred(items[i]) {
-			return &items[i]
-		}
-	}
-	return nil
+	return uci.FindSectionByID(sections, key)
 }
 
 // runUCISetCommand executes one parsed uci_set subcommand against runner,
@@ -193,10 +179,8 @@ func runUCIGet(runner uci.UCIRunner, rest []string) (string, error) {
 	}
 }
 
-// runUCISet handles `uci set config.section=type` (create-or-retype: Add if
-// the named section doesn't exist yet, RetypeExisting if it exists under a
-// different type, no-op if the type already matches — mirrors
-// apply/applier.go's applySection create-vs-retype branch) and
+// runUCISet handles `uci set config.section=type` (create-or-retype via
+// uci.CreateOrRetype, shared with apply/applier.go's applySection) and
 // `uci set config.section.option=value` (SetValues).
 func runUCISet(runner uci.UCIRunner, rest []string) error {
 	if len(rest) != 1 {
@@ -217,15 +201,7 @@ func runUCISet(runner uci.UCIRunner, rest []string) error {
 
 	if addr.Option == "" {
 		existing := findUCISection(sections, sectionID)
-		switch {
-		case existing == nil:
-			_, err := runner.Add(addr.Config, value, sectionID)
-			return err
-		case existing.Type != value:
-			return runner.RetypeExisting(addr.Config, sectionID, value)
-		default:
-			return nil
-		}
+		return uci.CreateOrRetype(runner, addr.Config, sectionID, value, existing)
 	}
 	return runner.SetValues(addr.Config, sectionID, map[string]interface{}{addr.Option: value})
 }

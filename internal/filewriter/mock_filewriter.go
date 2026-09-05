@@ -66,12 +66,15 @@ func (m *MockFileAccess) Remove(path string) error {
 	return nil
 }
 
-// Exists returns the injected value for path, or false if not configured.
-func (m *MockFileAccess) Exists(path string) bool {
+// Exists returns the injected value for path (or false if not configured),
+// and never an error — MockFileAccess has no notion of a failed existence
+// check distinct from "doesn't exist" (see OSFileAccess for that distinction
+// against a real device).
+func (m *MockFileAccess) Exists(path string) (bool, error) {
 	if m.ExistsPaths == nil {
-		return false
+		return false, nil
 	}
-	return m.ExistsPaths[path]
+	return m.ExistsPaths[path], nil
 }
 
 // ListDir returns the injected entries for path, or an empty list if not configured.

@@ -77,6 +77,53 @@ func decodeUbusUCIGet(out string) ([]Section, error) {
 	return sections, nil
 }
 
+// FindFirst returns a pointer to the first element of items matching pred, or
+// nil. Shared generic search helper — used by FindSectionByName/
+// FindSectionByID below, and directly by callers needing a different
+// predicate over a Section slice (e.g. agent/uci_set.go's combined
+// name-or-id lookup).
+func FindFirst[T any](items []T, pred func(T) bool) *T {
+	for i := range items {
+		if pred(items[i]) {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+// FindSectionByName returns the existing named section with the given name, or nil.
+func FindSectionByName(sections []Section, name string) *Section {
+	return FindFirst(sections, func(s Section) bool { return !s.Anonymous && s.Name == name })
+}
+
+// FindSectionByID returns the existing section with the given id, or nil.
+func FindSectionByID(sections []Section, id string) *Section {
+	return FindFirst(sections, func(s Section) bool { return s.ID == id })
+}
+
+// CreateOrRetype ensures a named section identified by sectionID exists in
+// pkg under wantType: creates it via Add if existingSec is nil (no section by
+// that name exists yet on the device), retypes it via RetypeExisting if it
+// exists under a different type, or does nothing if the type already
+// matches. Shared by apply.applySection and agent.runUCISet, both of which
+// need identical create-vs-retype semantics for a named section.
+func CreateOrRetype(runner UCIRunner, pkg, sectionID, wantType string, existingSec *Section) error {
+	switch {
+	case existingSec == nil:
+		if _, err := runner.Add(pkg, wantType, sectionID); err != nil {
+			return fmt.Errorf("add %s %s %s: %w", pkg, wantType, sectionID, err)
+		}
+		return nil
+	case existingSec.Type != wantType:
+		if err := runner.RetypeExisting(pkg, sectionID, wantType); err != nil {
+			return fmt.Errorf("retype %s.%s=%s: %w", pkg, sectionID, wantType, err)
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
 // GroupByType reproduces the section-type-keyed shape the agent's `/state`
 // payload has always used (named sections carry ".name", options are
 // string/[]string) — publishState builds this from GetSections instead of

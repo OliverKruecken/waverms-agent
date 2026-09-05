@@ -5,9 +5,11 @@ package filewriter
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/OliverKruecken/waverms-agent/internal/uci"
@@ -32,8 +34,10 @@ type FileAccess interface {
 	// error (matches rpcd's file.remove, which already treats a missing
 	// path as success).
 	Remove(path string) error
-	// Exists reports whether path exists.
-	Exists(path string) bool
+	// Exists reports whether path exists. err is non-nil only for a genuine
+	// failure to determine existence (e.g. rpcd unreachable) — the ordinary
+	// "path is absent" case is (false, nil).
+	Exists(path string) (bool, error)
 	// ListDir lists the entries directly under path.
 	ListDir(path string) ([]DirEntry, error)
 }
@@ -59,21 +63,33 @@ func (w *OSFileAccess) callFile(method string, params interface{}) (string, erro
 	return w.UCI.ExecCmd("ubus", "call", "file", method, string(body))
 }
 
-// ReadFile returns the contents of path via `ubus call file read`.
-//
-// rpcd distinguishes UBUS_STATUS_NOT_FOUND from other failures, but
-// UCIRunner.ExecCmd's generic error wrapping (via exec.Cmd.Output()'s
-// *exec.ExitError) doesn't preserve that distinction, and the `ubus` CLI's
-// exact exit-code/stderr text per status isn't a contract worth depending on
-// without a live device to verify it against. Every path this agent reads is
-// root-owned and the agent always runs as root, so in practice a read
-// failure here is absence, not a permission error — any failure is reported
-// as fs.ErrNotExist so callers' existing os.IsNotExist(err) checks (see
-// handleHostKeyFetch) keep working unchanged.
+// ubusStatusNotFound is UBUS_STATUS_NOT_FOUND, one of the fixed status codes
+// defined by ubus core itself (libubus/ubus.h) — not an rpcd-specific detail.
+// The `ubus` CLI propagates a failed call's status as its own process exit
+// code, so exec.Cmd surfaces it as *exec.ExitError.ExitCode().
+const ubusStatusNotFound = 4
+
+// isUbusNotFound reports whether err represents `ubus call` exiting with
+// UBUS_STATUS_NOT_FOUND specifically, as opposed to any other invocation
+// failure (rpcd unreachable, timeout, permission denied, malformed args, ...).
+func isUbusNotFound(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == ubusStatusNotFound
+}
+
+// ReadFile returns the contents of path via `ubus call file read`. A failure
+// is reported as fs.ErrNotExist only when the ubus call itself reports
+// UBUS_STATUS_NOT_FOUND (see isUbusNotFound) — matching callers' existing
+// os.IsNotExist(err) checks (see handleHostKeyFetch) — so any other failure
+// (rpcd unreachable, timeout, permission issue) is surfaced as a real error
+// instead of being misreported as "file absent".
 func (w *OSFileAccess) ReadFile(path string) ([]byte, error) {
 	out, err := w.callFile("read", map[string]interface{}{"path": path, "base64": true})
 	if err != nil {
-		return nil, fmt.Errorf("ubus file read %s: %w", path, fs.ErrNotExist)
+		if isUbusNotFound(err) {
+			return nil, fmt.Errorf("ubus file read %s: %w", path, fs.ErrNotExist)
+		}
+		return nil, fmt.Errorf("ubus file read %s: %w", path, err)
 	}
 	var resp struct {
 		Data string `json:"data"`
@@ -107,7 +123,10 @@ func (w *OSFileAccess) WriteFile(path string, content []byte, perm os.FileMode) 
 	var mkdirResp struct {
 		Code int `json:"code"`
 	}
-	if err := json.Unmarshal([]byte(mkdirOut), &mkdirResp); err == nil && mkdirResp.Code != 0 {
+	if err := json.Unmarshal([]byte(mkdirOut), &mkdirResp); err != nil {
+		return fmt.Errorf("decode mkdir %s response: %w", dir, err)
+	}
+	if mkdirResp.Code != 0 {
 		return fmt.Errorf("mkdir %s: exit code %d", dir, mkdirResp.Code)
 	}
 
@@ -134,10 +153,19 @@ func (w *OSFileAccess) Remove(path string) error {
 	return nil
 }
 
-// Exists reports whether path exists, via `ubus call file stat`.
-func (w *OSFileAccess) Exists(path string) bool {
+// Exists reports whether path exists, via `ubus call file stat`. Only a
+// UBUS_STATUS_NOT_FOUND result (see isUbusNotFound) is reported as (false,
+// nil) — any other failure (rpcd unreachable, timeout, permission issue) is
+// surfaced as an error rather than being misreported as "doesn't exist".
+func (w *OSFileAccess) Exists(path string) (bool, error) {
 	_, err := w.callFile("stat", map[string]interface{}{"path": path})
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if isUbusNotFound(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("ubus file stat %s: %w", path, err)
 }
 
 // ListDir lists the entries directly under path via `ubus call file list`.

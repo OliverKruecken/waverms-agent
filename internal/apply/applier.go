@@ -170,28 +170,6 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 	return nil
 }
 
-// findFirst returns a pointer to the first element of items matching pred, or
-// nil. Shared by findSectionByName/findSectionByID below — mirrors the
-// generic registry helpers in internal/agent/stopregistry.go.
-func findFirst[T any](items []T, pred func(T) bool) *T {
-	for i := range items {
-		if pred(items[i]) {
-			return &items[i]
-		}
-	}
-	return nil
-}
-
-// findSectionByName returns the existing named section with the given name, or nil.
-func findSectionByName(sections []uci.Section, name string) *uci.Section {
-	return findFirst(sections, func(s uci.Section) bool { return !s.Anonymous && s.Name == name })
-}
-
-// findSectionByID returns the existing section with the given id, or nil.
-func findSectionByID(sections []uci.Section, id string) *uci.Section {
-	return findFirst(sections, func(s uci.Section) bool { return s.ID == id })
-}
-
 // existingSectionTypes returns the distinct section types currently present
 // in sections, regardless of what the desired payload lists.
 func existingSectionTypes(sections []uci.Section) []string {
@@ -249,22 +227,14 @@ func (a *Applier) applySection(pkgName, sectionType string, section map[string]i
 	switch {
 	case hasName:
 		sectionID = name
-		existingSec = findSectionByName(existing, name)
-		switch {
-		case existingSec == nil:
-			// Doesn't exist on the device yet: create it under its desired name.
-			if _, err := a.runner.Add(pkgName, sectionType, sectionID); err != nil {
-				return fmt.Errorf("add %s %s %s: %w", pkgName, sectionType, sectionID, err)
-			}
-		case existingSec.Type != sectionType:
-			if err := a.runner.RetypeExisting(pkgName, sectionID, sectionType); err != nil {
-				return fmt.Errorf("retype %s.%s=%s: %w", pkgName, sectionID, sectionType, err)
-			}
+		existingSec = uci.FindSectionByName(existing, name)
+		if err := uci.CreateOrRetype(a.runner, pkgName, sectionID, sectionType, existingSec); err != nil {
+			return err
 		}
 	case reuseID != "":
 		// Reuse an existing anonymous section instead of appending a new one.
 		sectionID = reuseID
-		existingSec = findSectionByID(existing, reuseID)
+		existingSec = uci.FindSectionByID(existing, reuseID)
 	default:
 		id, err := a.runner.Add(pkgName, sectionType, "")
 		if err != nil {

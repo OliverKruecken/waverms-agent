@@ -227,7 +227,12 @@ func (a *Agent) handleHostKeyRemove(cmd Command) {
 		// distinguish "didn't exist" from "removal failed"; check existence
 		// first so the removed count still reflects files that genuinely
 		// existed, same as before.
-		if !a.fileAccess.Exists(path) {
+		exists, err := a.fileAccess.Exists(path)
+		if err != nil {
+			slog.Warn("host_key_remove: could not check existence", "cmd_id", cmd.CmdID, "path", path, "err", err)
+			continue
+		}
+		if !exists {
 			continue
 		}
 		if err := a.fileAccess.Remove(path); err != nil {
@@ -410,7 +415,13 @@ func (a *Agent) handleServiceApply(cmd Command) {
 			continue
 		}
 		script := filepath.Join(a.initdDir, name)
-		if !a.fileAccess.Exists(script) {
+		exists, err := a.fileAccess.Exists(script)
+		if err != nil {
+			slog.Error("service_apply: existence check failed", "cmd_id", cmd.CmdID, "name", name, "err", err)
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		if !exists {
 			slog.Warn("service_apply: service not found, skipping", "cmd_id", cmd.CmdID, "name", name)
 			errs = append(errs, fmt.Sprintf("%s: not found", name))
 			continue
