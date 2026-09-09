@@ -512,6 +512,96 @@ func TestApply_ReplaceMode_UnlistedTypeKeepsNamedSectionFromListedType(t *testin
 	assert.Equal(t, "ACCEPT", values["input"])
 }
 
+func TestApply_DeleteMarker_SweepsEntirePackage(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Sections: map[string][]uci.Section{
+			"firewall": {
+				{ID: "cfg-defaults0", Type: "defaults", Anonymous: true},
+				{ID: "cfg-rule0", Type: "rule", Anonymous: true, Options: map[string]interface{}{"name": "Allow-Ping"}},
+				{ID: "cfg-zone0", Type: "zone", Anonymous: true, Options: map[string]interface{}{"name": "lan"}},
+			},
+		},
+	}
+	a := apply.New(mock)
+
+	cfg := `{"firewall": {".delete": true}}`
+	committed, err := a.Apply(json.RawMessage(cfg))
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t, []string{"firewall"}, committed)
+	assert.Contains(t, mock.Calls, "delete firewall.cfg-defaults0")
+	assert.Contains(t, mock.Calls, "delete firewall.cfg-rule0")
+	assert.Contains(t, mock.Calls, "delete firewall.cfg-zone0")
+	for _, call := range mock.Calls {
+		assert.NotContains(t, call, "add ")
+	}
+	assert.Empty(t, mock.SetValuesCalls)
+	assert.Contains(t, mock.Calls, "commit firewall")
+}
+
+func TestApply_DeleteMarker_IgnoresOtherKeysInPayload(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Sections: map[string][]uci.Section{
+			"firewall": {
+				{ID: "cfg-rule0", Type: "rule", Anonymous: true, Options: map[string]interface{}{"name": "Allow-Ping"}},
+			},
+		},
+	}
+	a := apply.New(mock)
+
+	cfg := `{
+  "firewall": {
+    ".delete": true,
+    "defaults": { "input": "ACCEPT" }
+  }
+}`
+	_, err := a.Apply(json.RawMessage(cfg))
+	require.NoError(t, err)
+
+	assert.Contains(t, mock.Calls, "delete firewall.cfg-rule0")
+	_, ok := setValuesFor(mock, "firewall", "defaults")
+	assert.False(t, ok, "the \"defaults\" section content accompanying \".delete\" must be ignored, not applied")
+	for _, call := range mock.Calls {
+		assert.NotContains(t, call, "add ")
+	}
+}
+
+func TestApply_DeleteMarker_FalseValueBehavesLikeAbsent(t *testing.T) {
+	mock := &uci.MockUCIRunner{
+		Sections: map[string][]uci.Section{
+			"firewall": {
+				{ID: "cfg-rule0", Type: "rule", Anonymous: true, Options: map[string]interface{}{"name": "Allow-Ping"}},
+			},
+		},
+	}
+	a := apply.New(mock)
+
+	cfg := `{
+  "firewall": {
+    ".delete": false,
+    "defaults": { "input": "ACCEPT" }
+  }
+}`
+	_, err := a.Apply(json.RawMessage(cfg))
+	require.NoError(t, err)
+
+	assert.NotContains(t, mock.Calls, "delete firewall.cfg-rule0",
+		"a pre-existing section of an unlisted type must survive default merge-mode behavior")
+	assert.Contains(t, mock.Calls, "add firewall defaults")
+}
+
+func TestApply_DeleteMarker_CommitsEmptyPackage(t *testing.T) {
+	mock := &uci.MockUCIRunner{}
+	a := apply.New(mock)
+
+	cfg := `{"firewall": {".delete": true}}`
+	committed, err := a.Apply(json.RawMessage(cfg))
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t, []string{"firewall"}, committed)
+	assert.Contains(t, mock.Calls, "commit firewall")
+}
+
 func TestApply_ReplaceMode_DeletesEachAnonSectionByItsStableID(t *testing.T) {
 	// Simulates the production scenario that used to require reverse-order
 	// deletion under the CLI's positional @type[N] addressing: network has three

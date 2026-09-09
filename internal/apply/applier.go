@@ -87,6 +87,18 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 		_ = json.Unmarshal(v, &mode)
 	}
 
+	// ".delete": true is sugar for "replace mode, nothing listed" — reuses the
+	// replace-mode branch below to sweep every existing section of every type,
+	// ignoring any other keys the payload carries for this package.
+	if v, ok := pkgCfg[".delete"]; ok {
+		var del bool
+		_ = json.Unmarshal(v, &del)
+		if del {
+			mode = "replace"
+			pkgCfg = nil
+		}
+	}
+
 	// Collect and sort section-type keys for deterministic ordering.
 	// Firewall rules, DHCP pools, and other order-sensitive UCI sections
 	// must be staged in the same sequence on every apply call; a random
