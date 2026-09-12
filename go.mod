@@ -1,6 +1,6 @@
 module github.com/OliverKruecken/waverms-agent
 
-go 1.24.0
+go 1.27.1
 
 require (
 	github.com/eclipse/paho.golang v0.23.0
