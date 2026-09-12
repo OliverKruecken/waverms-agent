@@ -399,65 +399,6 @@ func isTlsCertPathAllowed(path string) bool {
 	return pathHasAllowedPrefix(path, tlsCertAllowedDirs)
 }
 
-func (a *Agent) handleServiceApply(cmd Command) {
-	var p struct {
-		Services map[string]bool `json:"services"`
-	}
-	if !a.decodeOrAck(cmd, &p) {
-		return
-	}
-
-	var errs []string
-	for name, enable := range p.Services {
-		if !safeIdentifierRe.MatchString(name) || len(name) > 64 {
-			slog.Warn("service_apply: invalid service name, skipping", "cmd_id", cmd.CmdID, "name", name)
-			errs = append(errs, fmt.Sprintf("%s: invalid name", name))
-			continue
-		}
-		script := filepath.Join(a.initdDir, name)
-		exists, err := a.fileAccess.Exists(script)
-		if err != nil {
-			slog.Error("service_apply: existence check failed", "cmd_id", cmd.CmdID, "name", name, "err", err)
-			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
-			continue
-		}
-		if !exists {
-			slog.Warn("service_apply: service not found, skipping", "cmd_id", cmd.CmdID, "name", name)
-			errs = append(errs, fmt.Sprintf("%s: not found", name))
-			continue
-		}
-
-		if enable {
-			if _, err := a.uci.ExecCmd(script, "enable"); err != nil {
-				slog.Error("service_apply: enable failed", "cmd_id", cmd.CmdID, "name", name, "err", err)
-				errs = append(errs, fmt.Sprintf("%s: enable: %v", name, err))
-				continue
-			}
-			if _, err := a.uci.ExecCmd(script, "start"); err != nil {
-				slog.Error("service_apply: start failed", "cmd_id", cmd.CmdID, "name", name, "err", err)
-				errs = append(errs, fmt.Sprintf("%s: start: %v", name, err))
-				continue
-			}
-		} else {
-			if _, err := a.uci.ExecCmd(script, "stop"); err != nil {
-				slog.Warn("service_apply: stop failed (best-effort)", "cmd_id", cmd.CmdID, "name", name, "err", err)
-			}
-			if _, err := a.uci.ExecCmd(script, "disable"); err != nil {
-				slog.Error("service_apply: disable failed", "cmd_id", cmd.CmdID, "name", name, "err", err)
-				errs = append(errs, fmt.Sprintf("%s: disable: %v", name, err))
-				continue
-			}
-		}
-		slog.Info("service_apply: applied", "cmd_id", cmd.CmdID, "name", name, "enabled", enable)
-	}
-
-	if len(errs) > 0 {
-		a.publishAck(cmd.CmdID, "error", strings.Join(errs, "; "))
-		return
-	}
-	a.publishAck(cmd.CmdID, "ok", "")
-}
-
 type logControlPayload struct {
 	Enabled bool `json:"enabled"`
 }

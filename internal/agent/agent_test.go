@@ -2278,6 +2278,27 @@ func TestPublishInfo_CapabilitiesContainLogLevelControl(t *testing.T) {
 	assert.Contains(t, info.Capabilities, "log_level_control")
 }
 
+// fileAccessForDir builds a MockFileAccess whose ListDir reflects the real
+// files present in dir at call time, bridging discoverPackages tests' real
+// t.TempDir()-based setup to the mock-based production FileAccess seam.
+func fileAccessForDir(dir string) *filewriter.MockFileAccess {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return &filewriter.MockFileAccess{}
+	}
+	dirEntries := make([]filewriter.DirEntry, 0, len(entries))
+	for _, e := range entries {
+		dirEntries = append(dirEntries, filewriter.DirEntry{
+			Name:      e.Name(),
+			IsRegular: e.Type().IsRegular(),
+			IsSymlink: e.Type()&os.ModeSymlink != 0,
+		})
+	}
+	return &filewriter.MockFileAccess{
+		ListDirs: map[string][]filewriter.DirEntry{dir: dirEntries},
+	}
+}
+
 func TestDiscoverPackages_SkipsOpkgApkArtifactFiles(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{

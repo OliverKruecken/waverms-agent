@@ -324,7 +324,6 @@ var supportedCapabilities = []string{
 	"set_password",
 	"tls_cert_push",
 	"tls_cert_remove",
-	"service_apply",
 	"sysupgrade",
 	"log_control",
 	"logs_fetch",
@@ -377,33 +376,6 @@ func discoverPackages(fw filewriter.FileAccess, configDir string) []string {
 		return fallbackStatePackages
 	}
 	return pkgs
-}
-
-// discoverServices scans initdDir for service scripts and returns their enabled/running state.
-// Best-effort: entries that cannot be checked are skipped silently.
-func discoverServices(fw filewriter.FileAccess, runner uci.UCIRunner, initdDir string) []ServiceInfo {
-	entries, err := fw.ListDir(initdDir)
-	if err != nil {
-		slog.Debug("discoverServices: cannot read initd dir", "dir", initdDir, "err", err)
-		return nil
-	}
-	var services []ServiceInfo
-	for _, e := range entries {
-		if !e.IsRegular && !e.IsSymlink {
-			continue
-		}
-		name := e.Name
-		if !safeIdentifierRe.MatchString(name) {
-			continue
-		}
-		script := initdDir + "/" + name
-		_, errEnabled := runner.ExecCmd(script, "enabled")
-		enabled := errEnabled == nil
-		_, errRunning := runner.ExecCmd(script, "running")
-		running := errRunning == nil
-		services = append(services, ServiceInfo{Name: name, Enabled: enabled, Running: running})
-	}
-	return services
 }
 
 // Options holds all dependencies for the Agent.
@@ -705,7 +677,6 @@ func New(opts *Options) *Agent {
 		"set_password":     a.handleSetPassword,
 		"tls_cert_push":    a.handleTlsCertPush,
 		"tls_cert_remove":  a.handleTlsCertRemove,
-		"service_apply":    a.handleServiceApply,
 		"sysupgrade":       a.handleSysupgrade,
 		"log_control":      a.handleLogControl,
 		"logs_fetch":       a.handleLogsFetch,
