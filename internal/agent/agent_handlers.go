@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -286,7 +288,14 @@ func (a *Agent) handleHostKeyFetch(cmd Command) {
 		path := a.sshDaemon.Dir + name
 		content, err := a.fileAccess.ReadFile(path)
 		if err != nil {
-			if os.IsNotExist(err) {
+			// os.IsNotExist(err) does NOT recognize this — FileAccess.ReadFile
+			// wraps fs.ErrNotExist via fmt.Errorf's %w (see filewriter.go),
+			// and os.IsNotExist only unwraps *PathError/*LinkError/*SyscallError,
+			// not an arbitrary %w chain. errors.Is does the correct generic
+			// unwrap. This was confirmed live: a device correctly reporting
+			// "file does not exist" per-candidate still failed host_key_fetch
+			// entirely because this check never matched.
+			if errors.Is(err, fs.ErrNotExist) {
 				slog.Debug("host_key_fetch: not found, skipping", "file", path)
 				continue
 			}

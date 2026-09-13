@@ -1,6 +1,9 @@
 package filewriter
 
-import "os"
+import (
+	"fmt"
+	"os"
+)
 
 // WriteCall records a single call to MockFileAccess.WriteFile.
 type WriteCall struct {
@@ -39,7 +42,14 @@ func (m *MockFileAccess) WriteFile(path string, content []byte, perm os.FileMode
 	return nil
 }
 
-// ReadFile returns the injected content for path, or os.ErrNotExist if not configured.
+// ReadFile returns the injected content for path, or a wrapped os.ErrNotExist
+// if not configured — wrapped via %w rather than returned bare, matching how
+// OSFileAccess.ReadFile actually reports "not found" in production (see
+// filewriter.go), so callers checking errors.Is(err, fs.ErrNotExist) (the
+// only correct check — see handleHostKeyFetch) are exercised realistically.
+// A bare os.ErrNotExist here would let a caller wrongly using
+// os.IsNotExist(err) pass tests while failing against the real
+// implementation's wrapped error, exactly as happened before this fix.
 func (m *MockFileAccess) ReadFile(path string) ([]byte, error) {
 	if m.ReadErrors != nil {
 		if err, ok := m.ReadErrors[path]; ok {
@@ -51,7 +61,7 @@ func (m *MockFileAccess) ReadFile(path string) ([]byte, error) {
 			return content, nil
 		}
 	}
-	return nil, os.ErrNotExist
+	return nil, fmt.Errorf("mock file read %s: %w", path, os.ErrNotExist)
 }
 
 // Remove records the call and returns any injected error for path. Matches
