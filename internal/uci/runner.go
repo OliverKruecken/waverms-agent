@@ -142,6 +142,13 @@ func (r *RealUCIRunner) Delete(pkg, sectionID string) error {
 
 func (r *RealUCIRunner) Commit(pkg string) error {
 	_, err := r.ubusUCI("commit", map[string]string{"config": pkg})
+	if err != nil && IsNotFound(err) {
+		// Nothing was staged for pkg — e.g. a whole-package ".delete" (see
+		// apply.stagePackage) on a package that doesn't exist on this device,
+		// so there was nothing to remove. There's no uci transaction to
+		// commit, which is a legitimate no-op, not a failure.
+		return nil
+	}
 	return err
 }
 

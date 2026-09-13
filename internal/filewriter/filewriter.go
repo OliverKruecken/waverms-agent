@@ -5,11 +5,9 @@ package filewriter
 import (
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 
 	"github.com/OliverKruecken/waverms-agent/internal/uci"
@@ -63,30 +61,16 @@ func (w *OSFileAccess) callFile(method string, params interface{}) (string, erro
 	return w.UCI.ExecCmd("ubus", "call", "file", method, string(body))
 }
 
-// ubusStatusNotFound is UBUS_STATUS_NOT_FOUND, one of the fixed status codes
-// defined by ubus core itself (libubus/ubus.h) — not an rpcd-specific detail.
-// The `ubus` CLI propagates a failed call's status as its own process exit
-// code, so exec.Cmd surfaces it as *exec.ExitError.ExitCode().
-const ubusStatusNotFound = 4
-
-// isUbusNotFound reports whether err represents `ubus call` exiting with
-// UBUS_STATUS_NOT_FOUND specifically, as opposed to any other invocation
-// failure (rpcd unreachable, timeout, permission denied, malformed args, ...).
-func isUbusNotFound(err error) bool {
-	var exitErr *exec.ExitError
-	return errors.As(err, &exitErr) && exitErr.ExitCode() == ubusStatusNotFound
-}
-
 // ReadFile returns the contents of path via `ubus call file read`. A failure
 // is reported as fs.ErrNotExist only when the ubus call itself reports
-// UBUS_STATUS_NOT_FOUND (see isUbusNotFound) — matching callers' existing
+// UBUS_STATUS_NOT_FOUND (see uci.IsNotFound) — matching callers' existing
 // os.IsNotExist(err) checks (see handleHostKeyFetch) — so any other failure
 // (rpcd unreachable, timeout, permission issue) is surfaced as a real error
 // instead of being misreported as "file absent".
 func (w *OSFileAccess) ReadFile(path string) ([]byte, error) {
 	out, err := w.callFile("read", map[string]interface{}{"path": path, "base64": true})
 	if err != nil {
-		if isUbusNotFound(err) {
+		if uci.IsNotFound(err) {
 			return nil, fmt.Errorf("ubus file read %s: %w", path, fs.ErrNotExist)
 		}
 		return nil, fmt.Errorf("ubus file read %s: %w", path, err)
@@ -154,7 +138,7 @@ func (w *OSFileAccess) Remove(path string) error {
 }
 
 // Exists reports whether path exists, via `ubus call file stat`. Only a
-// UBUS_STATUS_NOT_FOUND result (see isUbusNotFound) is reported as (false,
+// UBUS_STATUS_NOT_FOUND result (see uci.IsNotFound) is reported as (false,
 // nil) — any other failure (rpcd unreachable, timeout, permission issue) is
 // surfaced as an error rather than being misreported as "doesn't exist".
 func (w *OSFileAccess) Exists(path string) (bool, error) {
@@ -162,7 +146,7 @@ func (w *OSFileAccess) Exists(path string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if isUbusNotFound(err) {
+	if uci.IsNotFound(err) {
 		return false, nil
 	}
 	return false, fmt.Errorf("ubus file stat %s: %w", path, err)

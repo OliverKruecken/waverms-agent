@@ -17,8 +17,11 @@ import (
 // exitErrorWithCode runs a trivial shell command that exits with code, returning
 // the resulting *exec.ExitError — the same concrete error type
 // exec.Cmd.Output() (and thus UCIRunner.ExecCmd) produces for a real `ubus`
-// invocation that fails, so isUbusNotFound's errors.As check exercises the
-// real type rather than an opaque sentinel like assert.AnError.
+// invocation that fails, so uci.IsNotFound's errors.As check exercises the
+// real type rather than an opaque sentinel like assert.AnError. Mirrored in
+// internal/uci/ubus_status_test.go, which tests IsNotFound directly — Go test
+// helpers aren't importable across packages, so this small helper is kept in
+// both places rather than shared.
 func exitErrorWithCode(t *testing.T, code int) error {
 	t.Helper()
 	err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code)).Run()
@@ -107,9 +110,10 @@ func TestOSFileAccess_ReadFile_ReturnsContent(t *testing.T) {
 
 func TestOSFileAccess_ReadFile_MissingFileReturnsNotExist(t *testing.T) {
 	// A missing file makes the real `ubus call file read` exit with
-	// UBUS_STATUS_NOT_FOUND (4) as its process exit code.
+	// UBUS_STATUS_NOT_FOUND as its process exit code — 252, not the raw
+	// status value 4 (see internal/uci.IsNotFound's doc comment).
 	readCmd := `cmd ubus call file read {"base64":true,"path":"/nonexistent/path/key"}`
-	uciMock := &uci.MockUCIRunner{Errors: map[string]error{readCmd: exitErrorWithCode(t, 4)}}
+	uciMock := &uci.MockUCIRunner{Errors: map[string]error{readCmd: exitErrorWithCode(t, 252)}}
 	w := &OSFileAccess{UCI: uciMock}
 
 	_, err := w.ReadFile("/nonexistent/path/key")
@@ -152,7 +156,7 @@ func TestOSFileAccess_Exists(t *testing.T) {
 
 func TestOSFileAccess_Exists_MissingReturnsFalse(t *testing.T) {
 	statCmd := `cmd ubus call file stat {"path":"/etc/init.d/nonexistent"}`
-	uciMock := &uci.MockUCIRunner{Errors: map[string]error{statCmd: exitErrorWithCode(t, 4)}}
+	uciMock := &uci.MockUCIRunner{Errors: map[string]error{statCmd: exitErrorWithCode(t, 252)}}
 	w := &OSFileAccess{UCI: uciMock}
 
 	exists, err := w.Exists("/etc/init.d/nonexistent")
