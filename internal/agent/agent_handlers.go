@@ -73,12 +73,14 @@ func (a *Agent) handleUCISet(cmd Command) {
 }
 
 func (a *Agent) handleConfigApply(cmd Command) {
-	if a.isDuplicateConfigApply(cmd.CmdID) {
-		// Broker redelivery of an already in-flight apply — the original
-		// watchdog is still running and will send the one ack for this
-		// cmd_id when it resolves. Reprocessing here would apply the same
-		// config twice and race a second watchdog against the first.
-		slog.Warn("config_apply: duplicate delivery while watchdog still in flight, ignoring", "cmd_id", cmd.CmdID)
+	if a.wasConfigApplySeen(cmd.CmdID) {
+		// Broker redelivery of a config_apply already handled once —
+		// whether its watchdog is still in flight, or has already confirmed
+		// or rolled back. Reprocessing here would apply the same config
+		// again and start a brand-new watchdog, which can observe no
+		// session yet at its own start and roll back a change that was
+		// never actually in trouble. See wasConfigApplySeen.
+		slog.Warn("config_apply: duplicate delivery, ignoring", "cmd_id", cmd.CmdID)
 		return
 	}
 

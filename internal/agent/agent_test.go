@@ -1180,7 +1180,7 @@ func TestHandleCommand_ConfigApply_DuplicateDelivery_Ignored(t *testing.T) {
 
 	// First delivery: applies the config and leaves a watchdog in flight.
 	a.handleCommand("device/test-device-uuid/cmd", []byte(payload))
-	require.True(t, a.isDuplicateConfigApply("dup-1"), "watchdog for dup-1 must be tracked as in-flight")
+	require.True(t, a.wasConfigApplySeen("dup-1"), "dup-1 must be tracked as already seen")
 	callsAfterFirst := len(uciMock.Calls)
 
 	// Second delivery: broker redelivery of the same un-acked command. Must
@@ -1207,6 +1207,68 @@ func TestHandleCommand_ConfigApply_DuplicateDelivery_Ignored(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, ackCount, "exactly one ack must be sent for the deduplicated cmd_id")
+}
+
+// TestHandleCommand_ConfigApply_RedeliveryAfterWatchdogResolved_Ignored guards
+// against the gap the narrower confirmCmdID-based check left open: a real
+// device saw the broker redeliver an already-fully-resolved config_apply
+// (its watchdog had already confirmed, but the "ok" ack never made it back
+// due to an ongoing reconnect storm) well after confirmCmdID had been
+// cleared. The redelivered copy was reprocessed from scratch — a second
+// watchdog that immediately observed "no active session" and rolled back a
+// config change that had already succeeded and been confirmed.
+func TestHandleCommand_ConfigApply_RedeliveryAfterWatchdogResolved_Ignored(t *testing.T) {
+	mock := mqttclient.NewMockMQTTClient()
+	uciMock := &uci.MockUCIRunner{
+		Sections: map[string][]uci.Section{
+			"system": systemUCISections,
+		},
+	}
+	a := newTestAgent(mock, uciMock)
+	a.setSessionDisconnCh(make(chan struct{}))
+
+	payload := `{
+		"cmd_id": "dup-2",
+		"type": "config_apply",
+		"payload": {
+			"system": {
+				".mode": "merge",
+				"system": [{ ".name": "system", "hostname": "router-01" }]
+			}
+		}
+	}`
+
+	// First delivery: applies the config and starts a watchdog.
+	a.handleCommand("device/test-device-uuid/cmd", []byte(payload))
+	callsAfterFirst := len(uciMock.Calls)
+
+	// Resolve the original watchdog (e.g. a config_confirm arrives) and wait
+	// for its "ok" ack — this is the point where the old confirmCmdID-based
+	// guard was torn down, reopening the window for a later redelivery.
+	require.True(t, a.signalWatchdogConfirm("dup-2"))
+	require.Eventually(t, func() bool {
+		for _, p := range mock.PublishedSnapshot() {
+			if p.Topic == "device/test-device-uuid/ack" {
+				return true
+			}
+		}
+		return false
+	}, 500*time.Millisecond, 5*time.Millisecond)
+
+	// Second delivery, arriving after the first watchdog has already fully
+	// resolved: must still be recognized as a duplicate and dropped, not
+	// reprocessed into a second apply + a brand-new (and here doomed, since
+	// no session is registered for it) watchdog.
+	a.handleCommand("device/test-device-uuid/cmd", []byte(payload))
+	assert.Equal(t, callsAfterFirst, len(uciMock.Calls), "redelivery after resolution must not reapply the config")
+
+	ackCount := 0
+	for _, p := range mock.PublishedSnapshot() {
+		if p.Topic == "device/test-device-uuid/ack" {
+			ackCount++
+		}
+	}
+	assert.Equal(t, 1, ackCount, "exactly one ack must be sent across both deliveries")
 }
 
 func TestHandleCommand_ConfigApply_StagingError_AcksError(t *testing.T) {

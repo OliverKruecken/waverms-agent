@@ -488,6 +488,19 @@ type Agent struct {
 	confirmCmdID string
 	confirmCh    chan struct{}
 
+	// seenConfigApplyMu protects seenConfigApplyIDs/seenConfigApplyOrder, a
+	// small bounded record of config_apply cmd_ids the agent has already
+	// started processing at least once. Unlike confirmCmdID (torn down the
+	// moment the watchdog resolves, confirmed or rolled back), this persists
+	// for the rest of the process's life, bounded by maxSeenConfigApplyIDs —
+	// so a broker redelivery of an un-acked QoS-1 config_apply that arrives
+	// well after the original watchdog already finished is still recognized
+	// and dropped, instead of being reprocessed from scratch. See
+	// wasConfigApplySeen.
+	seenConfigApplyMu    sync.Mutex
+	seenConfigApplyIDs   map[string]struct{}
+	seenConfigApplyOrder []string
+
 	// tlsCertMu protects tlsCertPath and tlsKeyPath — the paths of the most
 	// recently successful tls_cert_push this session. Used by tlsCertFingerprint
 	// to know which file to read, and by tls_cert_remove to know what to delete.
@@ -708,20 +721,49 @@ func (a *Agent) clearWatchdogConfirm(cmdID string) {
 	a.confirmMu.Unlock()
 }
 
-// isDuplicateConfigApply reports whether cmdID matches the config_apply
-// currently tracked by an in-flight connectivity watchdog.
+// maxSeenConfigApplyIDs bounds seenConfigApplyIDs/seenConfigApplyOrder so the
+// dedup record can't grow unbounded over a device's uptime. A redelivery
+// arriving after this many other distinct config_apply commands have since
+// been processed is vanishingly unlikely in practice — MQTT broker
+// redelivery of one specific un-acked message doesn't survive that long —
+// and reprocessing it if it ever happens is a safe fallback: re-applying an
+// already-converged config is a no-op.
+const maxSeenConfigApplyIDs = 32
+
+// wasConfigApplySeen atomically checks whether cmdID has already been
+// handled by handleConfigApply at least once and, if not, records it.
+// Returns true when this is a redelivery the caller should ignore, false the
+// first time a given cmd_id is seen (caller should proceed).
 //
 // The broker redelivers an un-acked QoS-1 command whenever the session drops
 // before the client's ack for it round-trips — exactly what a config_apply
-// that restarts networking tends to trigger. Without this guard the agent
-// would reprocess the same apply from scratch on redelivery: a second
-// backup+reload+watchdog racing the still-running original, which can
-// observe no session yet at its own start and roll back a change that was
-// never actually in trouble.
-func (a *Agent) isDuplicateConfigApply(cmdID string) bool {
-	a.confirmMu.Lock()
-	defer a.confirmMu.Unlock()
-	return a.confirmCmdID == cmdID
+// that restarts networking tends to trigger. This guard covers redelivery at
+// any point after the first delivery, not just while the original
+// connectivity watchdog is still in flight (a narrower, now-replaced check
+// keyed on confirmCmdID used to miss a redelivery arriving after the
+// original watchdog had already confirmed or rolled back — see agent-src
+// commit history around the "no active session, rolling back" real-hardware
+// investigation). Without this guard the agent would reprocess the same
+// apply from scratch on redelivery: a second backup+reload+watchdog racing
+// (or replacing) the original, which can observe no session yet at its own
+// start and roll back a change that was never actually in trouble.
+func (a *Agent) wasConfigApplySeen(cmdID string) bool {
+	a.seenConfigApplyMu.Lock()
+	defer a.seenConfigApplyMu.Unlock()
+	if a.seenConfigApplyIDs == nil {
+		a.seenConfigApplyIDs = make(map[string]struct{}, maxSeenConfigApplyIDs)
+	}
+	if _, ok := a.seenConfigApplyIDs[cmdID]; ok {
+		return true
+	}
+	a.seenConfigApplyIDs[cmdID] = struct{}{}
+	a.seenConfigApplyOrder = append(a.seenConfigApplyOrder, cmdID)
+	if len(a.seenConfigApplyOrder) > maxSeenConfigApplyIDs {
+		oldest := a.seenConfigApplyOrder[0]
+		a.seenConfigApplyOrder = a.seenConfigApplyOrder[1:]
+		delete(a.seenConfigApplyIDs, oldest)
+	}
+	return false
 }
 
 // signalWatchdogConfirm closes the stored confirm channel if cmdID matches the
