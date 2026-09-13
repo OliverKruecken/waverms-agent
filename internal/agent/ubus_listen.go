@@ -21,6 +21,15 @@ var (
 	ubusListenStableAfter = 30 * time.Second
 )
 
+// ubusEventPublishQueueSize bounds the hand-off between runUbusListen's line
+// reader and its publisher (see runUbusListen). Matched (already
+// type-filtered) events are rare compared to the probe spam
+// UbusListenProcess.Lines() absorbs in its own 16-slot buffer — this only
+// needs to smooth over a single slow/blocked MQTT publish (up to
+// publishUbusEvent's own 10s context timeout during a degraded connection),
+// not sustained load.
+const ubusEventPublishQueueSize = 8
+
 // makeListenKey resolves the registry key for one ubus_listen registration —
 // same id-or-legacy-fallback contract as makeWatchKey (see its doc comment
 // in ubus_watch.go): a caller-supplied WatchID when present, or a synthetic
@@ -158,8 +167,27 @@ func (a *Agent) runUbusListen(key, watchID, event, objectPrefix string, stop cha
 		}
 
 		startedAt := time.Now()
-		done := make(chan struct{})
+		lineDone := make(chan struct{})
+		publishDone := make(chan struct{})
+		// publishQueue hands matched lines off from the reader goroutine
+		// (below) to the publisher goroutine, so a slow/blocked MQTT publish
+		// (up to publishUbusEvent's own 10s timeout, worse during a degraded
+		// connection) can never stall draining proc.Lines() — that stall is
+		// exactly what let UbusListenProcess's own 16-slot buffer overflow
+		// and silently drop probe *and* assoc lines alike on a real device.
+		// See docs/roaming.md.
+		publishQueue := make(chan string, ubusEventPublishQueueSize)
+
 		go func() {
+			defer close(publishDone)
+			for line := range publishQueue {
+				a.publishUbusEvent(event, watchID, line)
+			}
+		}()
+
+		go func() {
+			defer close(lineDone)
+			defer close(publishQueue)
 			for line := range proc.Lines() {
 				// proc.Lines() is unfiltered — a subscription to a hostapd
 				// object yields every notify type it sends (assoc/auth/probe
@@ -168,24 +196,36 @@ func (a *Agent) runUbusListen(key, watchID, event, objectPrefix string, stop cha
 				if !ubusLineMatchesType(line, event) {
 					continue
 				}
-				a.publishUbusEvent(event, watchID, line)
+				select {
+				case publishQueue <- line:
+				default:
+					// An already-type-matched event — unlike the line
+					// buffer's probe/auth spam, this is presumably a real
+					// event (e.g. a roam) — dropped only because the
+					// publisher is still stuck on a prior slow publish.
+					slog.Warn("ubus_listen: publish queue full, dropping event", "event", event)
+				}
 			}
-			close(done)
 		}()
 
 		select {
 		case <-stop:
 			proc.Stop()
 			cancel()
-			<-done
+			<-lineDone
+			<-publishDone
 			return
 		case <-disconnCh:
 			proc.Stop()
 			cancel()
-			<-done
+			<-lineDone
+			<-publishDone
 			return
-		case <-done:
-			// subprocess exited on its own (crash, ubus restarted, etc.)
+		case <-lineDone:
+			// subprocess exited on its own (crash, ubus restarted, etc.) —
+			// still wait for the publisher to drain whatever was already
+			// queued before restarting.
+			<-publishDone
 		}
 		cancel()
 		exitErr := proc.Wait()

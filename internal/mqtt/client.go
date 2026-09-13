@@ -75,6 +75,21 @@ func (d *disconnectState) get() error {
 	return d.reason
 }
 
+// maxConsecutivePublishFailures bounds how many Publish calls in a row may
+// fail before PahoClient gives up waiting for paho's own keepalive to notice
+// a dead connection and forces a reconnect itself. A real device showed a
+// firewall/network reload (triggered by its own config_apply) silently
+// black-hole an already-established MQTT session — no TCP RST, so every
+// Publish kept timing out (10-30s contexts, see internal/agent/agent.go)
+// while paho's PINGRESP-based detection took nearly 2.5 minutes to fire,
+// because ongoing publish attempts kept looking like connection activity and
+// deferred paho's idle-triggered keepalive PING. 3 matches this codebase's
+// existing "3 strikes" retry convention (ackPublishAttempts in agent.go): at
+// the shortest per-call timeout in use, that's still ~30s of sustained
+// failure — long enough to ride out a brief blip (e.g. a DHCP renewal)
+// without tripping, but far faster than waiting on keepalive alone.
+const maxConsecutivePublishFailures = 3
+
 // PahoClient wraps github.com/eclipse/paho.golang/paho and implements MQTTClient.
 type PahoClient struct {
 	tlsCfg *tls.Config
@@ -82,9 +97,11 @@ type PahoClient struct {
 	mu              sync.Mutex
 	client          *paho.Client
 	router          *paho.StandardRouter
+	conn            net.Conn
 	disconnCh       chan struct{}
 	closeOnce       *sync.Once
 	disconnectState *disconnectState
+	pubFailures     int
 }
 
 // NewPahoClient creates a PahoClient. Pass nil for tlsCfg to use plain TCP.
@@ -125,6 +142,8 @@ func (c *PahoClient) Connect(ctx context.Context, opts ConnectOptions) error {
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
+	c.conn = conn
+	c.pubFailures = 0
 
 	router := paho.NewStandardRouter()
 	c.router = router
@@ -189,13 +208,20 @@ func (c *PahoClient) Connect(ctx context.Context, opts ConnectOptions) error {
 	return nil
 }
 
-// Publish sends a message to topic.
+// Publish sends a message to topic. Consecutive failures (across all
+// callers — acks, heartbeat, state, ubus events) count toward
+// maxConsecutivePublishFailures; hitting that threshold force-trips the
+// connection as dead rather than waiting on paho's own keepalive to notice.
+// See maxConsecutivePublishFailures's doc comment for why.
 func (c *PahoClient) Publish(ctx context.Context, topic string, payload []byte, qos byte, retain bool) error {
 	c.mu.Lock()
 	client := c.client
 	c.mu.Unlock()
 
 	if client == nil {
+		// Already disconnected — a reconnect is presumably already in
+		// flight, so this doesn't count as a new failure toward the trip
+		// threshold.
 		return fmt.Errorf("not connected")
 	}
 
@@ -205,7 +231,57 @@ func (c *PahoClient) Publish(ctx context.Context, topic string, payload []byte, 
 		Topic:   topic,
 		Payload: payload,
 	})
+	c.recordPublishResult(err)
 	return err
+}
+
+// recordPublishResult updates the consecutive-failure counter and, on
+// crossing maxConsecutivePublishFailures, force-trips the connection as
+// dead. A success at any point resets the counter.
+func (c *PahoClient) recordPublishResult(err error) {
+	c.mu.Lock()
+	if err == nil {
+		c.pubFailures = 0
+		c.mu.Unlock()
+		return
+	}
+	c.pubFailures++
+	trip := c.pubFailures >= maxConsecutivePublishFailures
+	if trip {
+		c.pubFailures = 0
+	}
+	c.mu.Unlock()
+
+	if trip {
+		c.tripDisconnect(fmt.Errorf("%d consecutive publish failures, forcing reconnect: %w", maxConsecutivePublishFailures, err))
+	}
+}
+
+// tripDisconnect force-declares the current connection dead: closes the
+// underlying socket (unblocking any of paho's in-flight reads/writes, which
+// may themselves also drive OnClientError) and records reason + closes
+// disconnCh directly — the same effect OnClientError/OnServerDisconnect
+// have — rather than waiting on however paho happens to react to a closed
+// socket. Safe to call concurrently with a real OnClientError/
+// OnServerDisconnect firing for the same disconnect: closeOnce and
+// disconnectState.set (first reason wins) already make both idempotent.
+func (c *PahoClient) tripDisconnect(reason error) {
+	c.mu.Lock()
+	conn := c.conn
+	state := c.disconnectState
+	closeOnce := c.closeOnce
+	disconnCh := c.disconnCh
+	c.mu.Unlock()
+
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if state != nil {
+		state.set(reason)
+	}
+	if closeOnce != nil {
+		closeOnce.Do(func() { close(disconnCh) })
+	}
 }
 
 // Subscribe registers handler for all messages arriving on topic.
@@ -283,11 +359,12 @@ type MockMQTTClient struct {
 	PublishCalls  int // total Publish invocations, including failed ones
 	disconnCh     chan struct{}
 	connectErr    error
-	subscribeErr  error // returned by every Subscribe call when set
-	publishErr    error // returned by Publish while publishFails > 0
-	publishFails  int   // number of upcoming Publish calls that fail
-	disconnectCnt int   // incremented by every Disconnect call
-	disconnectErr error // returned by DisconnectReason; set via SetDisconnectReason
+	subscribeErr  error           // returned by every Subscribe call when set
+	publishErr    error           // returned by Publish while publishFails > 0
+	publishFails  int             // number of upcoming Publish calls that fail
+	disconnectCnt int             // incremented by every Disconnect call
+	disconnectErr error           // returned by DisconnectReason; set via SetDisconnectReason
+	publishGate   <-chan struct{} // if set, every Publish call waits for this to close first
 }
 
 // NewMockMQTTClient creates a ready-to-use mock.
@@ -328,7 +405,25 @@ func (m *MockMQTTClient) FailNextPublishes(n int, err error) {
 	m.publishErr = err
 }
 
+// BlockPublishesUntil makes every Publish call (in flight or future) wait
+// for gate to close before proceeding — simulates a stalled connection where
+// publishes hang rather than fail outright, e.g. for testing that a slow
+// publisher doesn't stall an unrelated consumer (see
+// TestRunUbusListen_SlowPublishDoesNotBlockLineReader).
+func (m *MockMQTTClient) BlockPublishesUntil(gate <-chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.publishGate = gate
+}
+
 func (m *MockMQTTClient) Publish(_ context.Context, topic string, payload []byte, qos byte, retain bool) error {
+	m.mu.Lock()
+	gate := m.publishGate
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.PublishCalls++

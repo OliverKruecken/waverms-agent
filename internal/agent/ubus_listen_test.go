@@ -219,6 +219,80 @@ func TestRunUbusListen_FiltersOutNonMatchingEventTypes(t *testing.T) {
 	a.listensMu.Unlock()
 }
 
+func TestRunUbusListen_SlowPublishDoesNotBlockLineReader(t *testing.T) {
+	// Reproduces the real-device incident this decoupling fixes: a stalled
+	// MQTT connection made publishUbusEvent block (up to its own 10s
+	// timeout) inside the same goroutine that drains proc.Lines() — a burst
+	// of hostapd events (probe spam plus real assoc events) piled up behind
+	// it and UbusListenProcess's 16-slot line buffer silently dropped the
+	// overflow, including — potentially — real roam events. After the fix,
+	// the line reader must keep draining regardless of how long publishing
+	// takes.
+	starter := &MockUbusListenStarter{}
+	mqttMock := mqttclient.NewMockMQTTClient()
+	a := newUbusListenTestAgent(mqttMock, starter)
+
+	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
+	waitForCondition(t, func() bool { return len(starter.StartedProcessesSnapshot()) == 1 })
+	proc := starter.StartedProcessesSnapshot()[0]
+
+	// Gate applied only now — handleUbusListen's own ack publish (above)
+	// must not be caught by it, or the test would deadlock before it starts.
+	gate := make(chan struct{})
+	mqttMock.BlockPublishesUntil(gate) // every Publish call hangs until closed below
+
+	// MockUbusListenProcess.Push sends on an unbuffered-beyond-16 channel and
+	// blocks the caller once full — exactly like the real subprocess's stdout
+	// pipe would back up. If the line reader were still stuck inside a
+	// blocking publish (the pre-fix behavior), pushing more than the 16-slot
+	// buffer would hang this goroutine. Pushing well beyond that (well beyond
+	// ubusEventPublishQueueSize too) and completing quickly proves the reader
+	// never stalls on the blocked publisher.
+	const linesToPush = 30
+	pushDone := make(chan struct{})
+	go func() {
+		defer close(pushDone)
+		for range linesToPush {
+			proc.Push(`{ "assoc": {"address":"aa:bb:cc:dd:ee:01"} }`)
+		}
+	}()
+
+	select {
+	case <-pushDone:
+		// expected: the reader kept draining despite the stalled publisher
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("pushing lines blocked — the line reader is stalled behind a slow publish")
+	}
+
+	// The queue between reader and publisher is bounded (ubusEventPublishQueueSize);
+	// once the first publish is unblocked, only what fit in the queue is
+	// eventually delivered — never all 30.
+	close(gate)
+	waitForCondition(t, func() bool {
+		count := 0
+		for _, m := range mqttMock.PublishedSnapshot() {
+			if m.Topic == "device/test-device-uuid/ubus-event" {
+				count++
+			}
+		}
+		return count > 0
+	})
+	time.Sleep(20 * time.Millisecond) // let the queue finish draining
+	count := 0
+	for _, m := range mqttMock.PublishedSnapshot() {
+		if m.Topic == "device/test-device-uuid/ubus-event" {
+			count++
+		}
+	}
+	if count == 0 || count >= linesToPush {
+		t.Errorf("published %d ubus-event messages, want between 1 and %d (queue-bounded, not all)", count, linesToPush-1)
+	}
+
+	a.listensMu.Lock()
+	close(a.listens[makeListenKey("", "assoc")])
+	a.listensMu.Unlock()
+}
+
 func TestRunUbusListen_RestartsAfterUnexpectedExit(t *testing.T) {
 	orig := ubusListenBaseBackoff
 	ubusListenBaseBackoff = time.Millisecond

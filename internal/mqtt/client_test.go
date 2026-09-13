@@ -3,11 +3,51 @@ package mqtt
 import (
 	"context"
 	"fmt"
+	"net"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// newPahoClientForTripTests builds a PahoClient with just the fields
+// recordPublishResult/tripDisconnect touch, bypassing Connect() (which needs
+// a real broker) — mirrors how disconnectState is tested standalone above.
+// Returns the client and the peer end of a net.Pipe standing in for the
+// broker connection, so tests can observe that tripDisconnect actually
+// closes the socket.
+func newPahoClientForTripTests(t *testing.T) (*PahoClient, net.Conn) {
+	t.Helper()
+	local, peer := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = peer.Close() })
+
+	c := &PahoClient{
+		conn:            local,
+		disconnCh:       make(chan struct{}),
+		closeOnce:       &sync.Once{},
+		disconnectState: &disconnectState{},
+	}
+	return c, peer
+}
+
+func assertClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	default:
+		t.Fatal("channel should be closed")
+	}
+}
+
+func assertOpen(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatal("channel should still be open")
+	default:
+	}
+}
 
 func TestMockMQTTClient_Connect_RecordsOpts(t *testing.T) {
 	m := NewMockMQTTClient()
@@ -161,6 +201,77 @@ func TestDisconnectState_SetGet_KeepsFirstReason(t *testing.T) {
 	// did) must not overwrite the first recorded reason.
 	s.set(fmt.Errorf("a different, later error"))
 	assert.ErrorIs(t, s.get(), assert.AnError, "first reason must win")
+}
+
+// --- PahoClient consecutive-publish-failure trip (no broker required) ---
+
+func TestPahoClient_RecordPublishResult_BelowThreshold_NoTrip(t *testing.T) {
+	c, _ := newPahoClientForTripTests(t)
+
+	for range maxConsecutivePublishFailures - 1 {
+		c.recordPublishResult(assert.AnError)
+	}
+
+	assertOpen(t, c.disconnCh)
+	assert.NoError(t, c.disconnectState.get())
+}
+
+func TestPahoClient_RecordPublishResult_ThresholdTrips(t *testing.T) {
+	c, peer := newPahoClientForTripTests(t)
+
+	for range maxConsecutivePublishFailures {
+		c.recordPublishResult(assert.AnError)
+	}
+
+	assertClosed(t, c.disconnCh)
+	require.Error(t, c.disconnectState.get())
+	assert.ErrorIs(t, c.disconnectState.get(), assert.AnError)
+
+	// The underlying connection must actually be closed, not just the
+	// disconnect channel — otherwise paho's own goroutines could keep
+	// spinning on a socket the agent has already given up on.
+	_, err := peer.Write([]byte("x"))
+	assert.Error(t, err, "peer write should fail once the local end is closed")
+}
+
+func TestPahoClient_RecordPublishResult_SuccessResetsCounter(t *testing.T) {
+	c, _ := newPahoClientForTripTests(t)
+
+	for range maxConsecutivePublishFailures - 1 {
+		c.recordPublishResult(assert.AnError)
+	}
+	c.recordPublishResult(nil) // success — resets the streak
+	for range maxConsecutivePublishFailures - 1 {
+		c.recordPublishResult(assert.AnError)
+	}
+
+	assertOpen(t, c.disconnCh)
+}
+
+func TestPahoClient_RecordPublishResult_NotConnected_DoesNotCount(t *testing.T) {
+	c := NewPahoClient(nil)
+	// Publish before Connect always hits the "not connected" fast path,
+	// which must never touch recordPublishResult/pubFailures at all.
+	for range maxConsecutivePublishFailures * 2 {
+		err := c.Publish(context.Background(), "t/1", []byte("x"), 1, false)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not connected")
+	}
+	assert.Equal(t, 0, c.pubFailures)
+}
+
+func TestPahoClient_TripDisconnect_ConcurrentWithOnClientError_FirstReasonWins(t *testing.T) {
+	c, _ := newPahoClientForTripTests(t)
+
+	// Simulate OnClientError firing first (as it would from paho's own
+	// PINGRESP-timeout detection), then the trip firing shortly after for
+	// the same underlying outage — both must be safe to call, and the
+	// original reason must survive.
+	c.tripDisconnect(fmt.Errorf("ping handler error: PINGRESP timed out"))
+	c.tripDisconnect(fmt.Errorf("3 consecutive publish failures, forcing reconnect"))
+
+	assertClosed(t, c.disconnCh)
+	assert.Contains(t, c.disconnectState.get().Error(), "PINGRESP timed out")
 }
 
 func TestMockMQTTClient_DisconnectReason(t *testing.T) {
