@@ -336,6 +336,7 @@ var supportedCapabilities = []string{
 	"ubus_watch_id",
 	"ubus_listen_v2",
 	"ubus_list",
+	"ubus_watch_prefix",
 }
 
 // fallbackStatePackages is used only when /etc/config cannot be read.
