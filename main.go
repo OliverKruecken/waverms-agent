@@ -47,8 +47,7 @@ func main() {
 	// stopping the procd-managed instance and running the binary by hand over
 	// SSH) without editing the persistent DEBUG=true key in /etc/waverms/config.
 	// It's equivalent to that config key, not additive to it — see cfg.Debug
-	// below, which both the initial handler and agent.go's later live-logs
-	// handler key off of.
+	// below, which the handler chain keys off of.
 	debugFlag := flag.Bool("debug", false, "enable debug-level logging for this run")
 	flag.Parse()
 
@@ -78,7 +77,7 @@ func main() {
 	// procd (per procd_set_param stdout/stderr 1 in the init script) tags every
 	// line it captures from stderr as LOG_ERR regardless of content, so routing
 	// normal logging through stderr made every record — including plain INFO
-	// lines — show up in logd, and therefore the live-logs snapshot, as an error.
+	// lines — show up in logd, and therefore the logs_fetch snapshot, as an error.
 	// See internal/agent/syslog_handler.go. A missing /dev/log (devcontainer, CI,
 	// any non-OpenWrt host) falls back to the old stderr-text behavior.
 	var textHandler slog.Handler

@@ -762,58 +762,6 @@ func TestRun_BootstrapForcesCleanStartOnNextConnect(t *testing.T) {
 			"command from before the wipe (e.g. the sysupgrade that triggered it) gets replayed")
 }
 
-// ---- handleLiveLogsControl tests -----------------------------------------------
-
-func newTestAgentWithLiveLogsHandler(mock *mqttclient.MockMQTTClient) (*Agent, *mqttLiveLogsHandler) {
-	a := newTestAgent(mock, &uci.MockUCIRunner{})
-	// Wire up a real mqttLiveLogsHandler so SetEnabled / mqttEnabled() are exercised.
-	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	dh := newMQTTLiveLogsHandler(textHandler, mock, a.creds.DeviceID)
-	a.liveLogsHandler = dh
-	return a, dh
-}
-
-func TestHandleLiveLogsControl_EnablesStreaming(t *testing.T) {
-	mock := mqttclient.NewMockMQTTClient()
-	a, dh := newTestAgentWithLiveLogsHandler(mock)
-
-	a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`{"enabled":true}`))
-
-	assert.True(t, dh.mqttEnabled(), "mqttEnabled must be true after enabled:true payload")
-}
-
-func TestHandleLiveLogsControl_DisablesStreaming(t *testing.T) {
-	mock := mqttclient.NewMockMQTTClient()
-	a, dh := newTestAgentWithLiveLogsHandler(mock)
-
-	// First enable, then disable.
-	a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`{"enabled":true}`))
-	require.True(t, dh.mqttEnabled())
-
-	a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`{"enabled":false}`))
-	assert.False(t, dh.mqttEnabled(), "mqttEnabled must be false after enabled:false payload")
-}
-
-func TestHandleLiveLogsControl_InvalidJSON_NoPanic(t *testing.T) {
-	mock := mqttclient.NewMockMQTTClient()
-	a, dh := newTestAgentWithLiveLogsHandler(mock)
-
-	// Must not panic; must leave state unchanged (false).
-	assert.NotPanics(t, func() {
-		a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`not-json`))
-	})
-	assert.False(t, dh.mqttEnabled(), "state must remain false after invalid payload")
-}
-
-func TestHandleLiveLogsControl_NilLiveLogsHandler_NoPanic(t *testing.T) {
-	mock := mqttclient.NewMockMQTTClient()
-	a := newTestAgent(mock, &uci.MockUCIRunner{})
-	// a.liveLogsHandler is nil — must not panic.
-	assert.NotPanics(t, func() {
-		a.handleLiveLogsControl("device/test-device-uuid/live-logs/control", []byte(`{"enabled":true}`))
-	})
-}
-
 // ---- handleLogLevelControl tests -----------------------------------------------
 
 func newTestAgentWithLogLevel(mock *mqttclient.MockMQTTClient) (*Agent, *slog.LevelVar) {
@@ -860,24 +808,6 @@ func TestHandleLogLevelControl_NilLogLevel_NoPanic(t *testing.T) {
 	assert.NotPanics(t, func() {
 		a.handleLogLevelControl("device/test-device-uuid/log-level/control", []byte(`{"enabled":true}`))
 	})
-}
-
-func TestRunSession_SubscribesLiveLogsControl(t *testing.T) {
-	mock := mqttclient.NewMockMQTTClient()
-	a := newTestAgent(mock, &uci.MockUCIRunner{})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		a.runSession(ctx) //nolint:errcheck
-	}()
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-	<-done
-
-	assert.True(t, mock.HasSubscription("device/test-device-uuid/live-logs/control"),
-		"runSession must subscribe to device/{id}/live-logs/control")
 }
 
 func TestRunSession_SubscribesLogLevelControl(t *testing.T) {

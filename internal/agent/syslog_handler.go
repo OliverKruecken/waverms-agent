@@ -36,7 +36,7 @@ type syslogState struct {
 // line it captures with one fixed severity per stream — stderr always as
 // LOG_ERR — rather than parsing the line's content. Routing normal application
 // logging through stderr therefore made every record, including plain INFO
-// lines, show up in logd (and so the live-logs snapshot's "priority" field) as
+// lines, show up in logd (and so the logs_fetch snapshot's "priority" field) as
 // an error. Writing straight to /dev/log with real syslog(3) semantics is the
 // only way logd sees the record's actual severity. procd's stderr capture stays
 // enabled at the init-script level, but now only ever sees uncaught Go panics

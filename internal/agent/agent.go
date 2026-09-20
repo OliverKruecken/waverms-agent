@@ -466,7 +466,6 @@ type Agent struct {
 	bootstrapTokenPath        string
 	bootstrapTokenWaitTimeout time.Duration
 	credsPath                 string
-	liveLogsHandler           *mqttLiveLogsHandler
 	activityLog               *ActivityLogHandler
 	logLevel                  *slog.LevelVar
 	cmdHandlers               map[string]func(Command)
@@ -892,12 +891,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.needsCleanStart.Store(true)
 	}
 
-	// Replace the global slog default with the MQTT-aware live-logs handler now that we
-	// have credentials. If main.go constructed a persistent ActivityLogHandler, reuse
-	// it here so bootstrap-phase and session-phase log lines land in the same file
-	// (and so the file is only ever opened by main.go — see the ActivityLog doc
-	// comment on Options, and the nil branch below, which must stay pure in-memory
-	// so tests that build an Agent directly via New() never touch the real filesystem).
+	// Re-point the global slog default now that we have credentials. If main.go
+	// constructed a persistent ActivityLogHandler, reuse it here so bootstrap-phase
+	// and session-phase log lines land in the same file (and so the file is only ever
+	// opened by main.go — see the ActivityLog doc comment on Options, and the nil
+	// branch below, which must stay pure in-memory so tests that build an Agent
+	// directly via New() never touch the real filesystem).
 	//
 	// This branch is only actually reached in tests: in production a.activityLog is
 	// always non-nil (set by main.go), so innerHandler below reuses its handler chain
@@ -915,8 +914,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	} else {
 		innerHandler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: localLevel})
 	}
-	a.liveLogsHandler = newMQTTLiveLogsHandler(innerHandler, a.mqtt, a.creds.DeviceID)
-	slog.SetDefault(slog.New(a.liveLogsHandler))
+	slog.SetDefault(slog.New(innerHandler))
 	log.SetFlags(0) // TextHandler owns timestamps; avoid double prefix on log.Printf calls
 
 	delay := time.Second
@@ -1025,12 +1023,6 @@ func (a *Agent) runSession(ctx context.Context) error {
 		return fmt.Errorf("subscribe info/request: %w", err)
 	}
 	slog.Debug("subscribed", "topic", infoReqTopic)
-
-	controlTopic := mqttclient.TopicLiveLogsControl(a.creds.DeviceID)
-	if err := subscribeOrDisconnect(controlTopic, 1, a.handleLiveLogsControl); err != nil {
-		return fmt.Errorf("subscribe live-logs/control: %w", err)
-	}
-	slog.Debug("subscribed", "topic", controlTopic)
 
 	logLevelTopic := mqttclient.TopicLogLevelControl(a.creds.DeviceID)
 	if err := subscribeOrDisconnect(logLevelTopic, 1, a.handleLogLevelControl); err != nil {
@@ -1263,29 +1255,13 @@ func (a *Agent) handleStateRequest(topic string, payload []byte) {
 	}
 }
 
-// handleLiveLogsControl toggles MQTT live log streaming at runtime.
-// The server publishes {"enabled": true|false} to device/{id}/live-logs/control (retain: true).
-func (a *Agent) handleLiveLogsControl(_ string, payload []byte) {
-	var msg struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := json.Unmarshal(payload, &msg); err != nil {
-		slog.Error("invalid live-logs/control payload", "err", err)
-		return
-	}
-	if a.liveLogsHandler != nil {
-		a.liveLogsHandler.SetEnabled(msg.Enabled)
-	}
-}
-
 // handleLogLevelControl processes an incoming log-level/control message by
 // raising or lowering the agent's baseline slog level at runtime — no restart
-// needed. Unlike handleLiveLogsControl (which only affects what's streamed
-// live), this changes what's written to the persistent activity log file too,
-// since a.logLevel is the same LevelVar every handler in main.go's chain reads
-// from. The retained MQTT topic re-delivers the last value on every
-// (re)subscribe, so the setting survives an agent restart without the agent
-// ever needing to persist it to disk itself.
+// needed. a.logLevel is the same LevelVar every handler in main.go's chain reads
+// from, so this changes what's written to the persistent activity log file too.
+// The retained MQTT topic re-delivers the last value on every (re)subscribe, so
+// the setting survives an agent restart without the agent ever needing to
+// persist it to disk itself.
 func (a *Agent) handleLogLevelControl(_ string, payload []byte) {
 	var msg struct {
 		Enabled bool `json:"enabled"`
