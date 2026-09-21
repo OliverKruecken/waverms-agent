@@ -49,6 +49,11 @@ func TopicState(deviceID string) string {
 	return fmt.Sprintf("device/%s/state", deviceID)
 }
 
+// TopicActivityLogControl returns the topic the server publishes persistent-activity-log toggles to (retain: true).
+func TopicActivityLogControl(deviceID string) string {
+	return fmt.Sprintf("device/%s/activity-log/control", deviceID)
+}
+
 // TopicLogLevelControl returns the topic the server publishes debug-level toggles to (retain: true).
 func TopicLogLevelControl(deviceID string) string {
 	return fmt.Sprintf("device/%s/log-level/control", deviceID)

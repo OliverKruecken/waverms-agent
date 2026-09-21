@@ -325,7 +325,7 @@ var supportedCapabilities = []string{
 	"tls_cert_push",
 	"tls_cert_remove",
 	"sysupgrade",
-	"log_control",
+	"activity_log_control",
 	"logs_fetch",
 	"log_level_control",
 	"ubus_call",
@@ -691,7 +691,6 @@ func New(opts *Options) *Agent {
 		"tls_cert_push":    a.handleTlsCertPush,
 		"tls_cert_remove":  a.handleTlsCertRemove,
 		"sysupgrade":       a.handleSysupgrade,
-		"log_control":      a.handleLogControl,
 		"logs_fetch":       a.handleLogsFetch,
 		"ubus_call":        a.handleUbusCall,
 		"ubus_list":        a.handleUbusList,
@@ -1030,6 +1029,12 @@ func (a *Agent) runSession(ctx context.Context) error {
 	}
 	slog.Debug("subscribed", "topic", logLevelTopic)
 
+	activityLogTopic := mqttclient.TopicActivityLogControl(a.creds.DeviceID)
+	if err := subscribeOrDisconnect(activityLogTopic, 1, a.handleActivityLogControl); err != nil {
+		return fmt.Errorf("subscribe activity-log/control: %w", err)
+	}
+	slog.Debug("subscribed", "topic", activityLogTopic)
+
 	// Clear the retained "offline" LWT so a restarting server does not receive a
 	// stale offline status for a device that is actually online.
 	if err := a.mqtt.Publish(ctx, mqttclient.TopicStatus(a.creds.DeviceID), []byte{}, 1, true); err != nil {
@@ -1279,6 +1284,28 @@ func (a *Agent) handleLogLevelControl(_ string, payload []byte) {
 		a.logLevel.Set(slog.LevelInfo)
 	}
 	slog.Info("log level updated via log-level/control", "debug_enabled", msg.Enabled)
+}
+
+// handleActivityLogControl processes an incoming activity-log/control message by
+// enabling or suspending the persistent activity log file (/etc/waverms/agent.log)
+// at runtime. It only gates the file: the wrapped syslog handler keeps logging
+// either way, so what logd (and the logs_fetch snapshot) sees is unchanged.
+// The retained MQTT topic re-delivers the last value on every (re)subscribe, so
+// the setting survives an agent restart — NewActivityLogHandler starts enabled,
+// and the retained message re-applies "off" moments after the session connects.
+func (a *Agent) handleActivityLogControl(_ string, payload []byte) {
+	var msg struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		slog.Error("invalid activity-log/control payload", "err", err)
+		return
+	}
+	if a.activityLog == nil {
+		return
+	}
+	a.activityLog.SetEnabled(msg.Enabled)
+	slog.Info("activity log updated via activity-log/control", "enabled", msg.Enabled)
 }
 
 // publishState collects UCI state for the given packages and publishes it

@@ -409,23 +409,3 @@ func (a *Agent) handleTlsCertRemove(cmd Command) {
 func isTlsCertPathAllowed(path string) bool {
 	return pathHasAllowedPrefix(path, tlsCertAllowedDirs)
 }
-
-type logControlPayload struct {
-	Enabled bool `json:"enabled"`
-}
-
-// handleLogControl toggles the persistent activity log file at runtime
-// (device.log survives reboots and is enabled by default — see
-// internal/agent/activitylog.go). Nil-safe: if the log file failed to open
-// at startup, a.activityLog is nil and this is a no-op ack "ok".
-func (a *Agent) handleLogControl(cmd Command) {
-	var p logControlPayload
-	if !a.decodeOrAck(cmd, &p) {
-		return
-	}
-	if a.activityLog != nil {
-		a.activityLog.SetEnabled(p.Enabled)
-	}
-	slog.Info("log_control applied", "cmd_id", cmd.CmdID, "enabled", p.Enabled)
-	a.publishAck(cmd.CmdID, "ok", "")
-}
