@@ -1,9 +1,9 @@
 module github.com/OliverKruecken/waverms-agent
 
-go 1.26.4
+go 1.23.12
 
 require (
-	github.com/eclipse/paho.golang v0.23.0
+	github.com/eclipse/paho.golang v0.22.0
 	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.11.1
 )
