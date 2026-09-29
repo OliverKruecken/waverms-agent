@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -311,6 +314,57 @@ func TestRunUbusListen_RestartsAfterUnexpectedExit(t *testing.T) {
 	if calls := starter.StartCallsSnapshot(); calls[1].EventType != "assoc" {
 		t.Errorf("restart StartCalls[1] = %+v, want EventType assoc", calls[1])
 	}
+
+	a.listensMu.Lock()
+	close(a.listens[makeListenKey("", "assoc")])
+	a.listensMu.Unlock()
+}
+
+// lockedBuffer is a bytes.Buffer safe for concurrent slog writes and test reads.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestRunUbusListen_NoMatchingObjectsWaitsQuietlyThenAttaches(t *testing.T) {
+	origBase, origMax := ubusListenNoObjectsBaseBackoff, ubusListenNoObjectsMaxBackoff
+	ubusListenNoObjectsBaseBackoff = time.Millisecond
+	ubusListenNoObjectsMaxBackoff = 4 * time.Millisecond
+	t.Cleanup(func() { ubusListenNoObjectsBaseBackoff, ubusListenNoObjectsMaxBackoff = origBase, origMax })
+
+	logs := &lockedBuffer{}
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	starter := &MockUbusListenStarter{StartErr: fmt.Errorf("%w matching prefix %q", errNoUbusObjects, "hostapd.")}
+	mqttMock := mqttclient.NewMockMQTTClient()
+	a := newUbusListenTestAgent(mqttMock, starter)
+
+	a.handleUbusListen(Command{CmdID: "l1", Type: "ubus_listen", Payload: []byte(`{"event":"assoc"}`)})
+	waitForCondition(t, func() bool { return len(starter.StartCallsSnapshot()) >= 4 })
+
+	if out := logs.String(); bytes.Contains([]byte(out), []byte("level=ERROR")) {
+		t.Errorf("no-objects wait logged an error:\n%s", out)
+	}
+	if n := bytes.Count([]byte(logs.String()), []byte("no matching ubus objects")); n != 1 {
+		t.Errorf("no-objects Info logged %d times, want exactly once", n)
+	}
+
+	starter.SetStartErr(nil)
+	waitForCondition(t, func() bool { return len(starter.StartedProcessesSnapshot()) == 1 })
 
 	a.listensMu.Lock()
 	close(a.listens[makeListenKey("", "assoc")])

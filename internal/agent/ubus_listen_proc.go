@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -93,6 +94,12 @@ type RealUbusListenStarter struct {
 // (/usr/share/rpcd/acl.d/*.json, e.g. "hostapd.*") is glob/prefix-based, not
 // regex, and this primitive's original hardcoded hostapd discovery already
 // reduced to nothing more than a prefix match — see docs/roaming.md.
+// errNoUbusObjects means no ubus object matched the requested prefix — the
+// normal state on a device without the matching daemon (e.g. hostapd on an
+// ethernet-only board), or before its radios are up. Distinct from a genuine
+// failure so runUbusListen can wait quietly instead of logging an error.
+var errNoUbusObjects = errors.New("no ubus objects found")
+
 func discoverUbusObjects(runner uci.UCIRunner, prefix string) ([]string, error) {
 	out, err := runner.ExecCmd("ubus", "list")
 	if err != nil {
@@ -114,7 +121,7 @@ func (s *RealUbusListenStarter) Start(ctx context.Context, objectPrefix, _ strin
 		return nil, err
 	}
 	if len(objects) == 0 {
-		return nil, fmt.Errorf("no ubus objects found matching prefix %q", objectPrefix)
+		return nil, fmt.Errorf("%w matching prefix %q", errNoUbusObjects, objectPrefix)
 	}
 
 	cmd := exec.CommandContext(ctx, "ubus", append([]string{"subscribe"}, objects...)...)
@@ -201,6 +208,13 @@ type MockUbusListenStarter struct {
 	StartCalls       []UbusListenStartCall // (objectPrefix, eventType) per call, in order
 	StartErr         error
 	StartedProcesses []*MockUbusListenProcess
+}
+
+// SetStartErr changes the error returned by subsequent Start calls (nil = succeed).
+func (m *MockUbusListenStarter) SetStartErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.StartErr = err
 }
 
 // UbusListenStartCall records one call to MockUbusListenStarter.Start.

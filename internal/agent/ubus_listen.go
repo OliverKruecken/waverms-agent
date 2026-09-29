@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -19,6 +20,13 @@ var (
 	ubusListenBaseBackoff = 1 * time.Second
 	ubusListenMaxBackoff  = 30 * time.Second
 	ubusListenStableAfter = 30 * time.Second
+
+	// ubusListenNoObjectsBaseBackoff/MaxBackoff pace the wait while no object
+	// matches the prefix at all (errNoUbusObjects) — e.g. no radios, so no
+	// hostapd. Far slower than the crash-restart loop: it's an expected state,
+	// polled only so a radio that shows up later is eventually picked up.
+	ubusListenNoObjectsBaseBackoff = 30 * time.Second
+	ubusListenNoObjectsMaxBackoff  = 5 * time.Minute
 )
 
 // ubusEventPublishQueueSize bounds the hand-off between runUbusListen's line
@@ -144,6 +152,8 @@ func (a *Agent) runUbusListen(key, watchID, event, objectPrefix string, stop cha
 
 	disconnCh := a.getSessionDisconnCh()
 	backoff := ubusListenBaseBackoff
+	noObjectsBackoff := ubusListenNoObjectsBaseBackoff
+	loggedNoObjects := false
 
 	for {
 		select {
@@ -156,6 +166,20 @@ func (a *Agent) runUbusListen(key, watchID, event, objectPrefix string, stop cha
 
 		ctx, cancel := context.WithCancel(context.Background())
 		proc, err := a.ubusListenStarter.Start(ctx, objectPrefix, event)
+		if errors.Is(err, errNoUbusObjects) {
+			cancel()
+			if !loggedNoObjects {
+				slog.Info("ubus_listen: no matching ubus objects (device has no such daemon or radios?), waiting", "event", event, "object_prefix", objectPrefix, "retry_in", noObjectsBackoff)
+				loggedNoObjects = true
+			} else {
+				slog.Debug("ubus_listen: still no matching ubus objects", "event", event, "object_prefix", objectPrefix, "retry_in", noObjectsBackoff)
+			}
+			if !a.sleepOrStop(noObjectsBackoff, stop, disconnCh) {
+				return
+			}
+			noObjectsBackoff = nextBackoff(noObjectsBackoff, ubusListenNoObjectsMaxBackoff)
+			continue
+		}
 		if err != nil {
 			cancel()
 			slog.Error("ubus_listen: start failed, retrying", "event", event, "err", err, "backoff", backoff)
@@ -166,6 +190,8 @@ func (a *Agent) runUbusListen(key, watchID, event, objectPrefix string, stop cha
 			continue
 		}
 
+		loggedNoObjects = false
+		noObjectsBackoff = ubusListenNoObjectsBaseBackoff
 		startedAt := time.Now()
 		lineDone := make(chan struct{})
 		publishDone := make(chan struct{})
@@ -283,9 +309,13 @@ func (a *Agent) publishUbusEvent(event, watchID, rawLine string) {
 }
 
 func nextUbusListenBackoff(cur time.Duration) time.Duration {
+	return nextBackoff(cur, ubusListenMaxBackoff)
+}
+
+func nextBackoff(cur, max time.Duration) time.Duration {
 	next := cur * 2
-	if next > ubusListenMaxBackoff {
-		return ubusListenMaxBackoff
+	if next > max {
+		return max
 	}
 	return next
 }
