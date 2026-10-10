@@ -129,6 +129,15 @@ func (a *Applier) stagePackage(pkgName string, pkgCfg map[string]json.RawMessage
 	existing, err := a.runner.GetSections(pkgName)
 	if err != nil {
 		existing = nil
+		// The package has no file on this device (e.g. luci on an image without LuCI).
+		// libuci can't add a section to it ("Entry not found", ubus exit 252), which
+		// would fail the whole two-phase apply, so create the empty package first. A
+		// payload that only deletes (no section types) has nothing to add — leave it.
+		if len(sectionTypes) > 0 {
+			if err := a.runner.EnsurePackage(pkgName); err != nil {
+				return fmt.Errorf("ensure package %s: %w", pkgName, err)
+			}
+		}
 	}
 
 	if mode == "replace" {
