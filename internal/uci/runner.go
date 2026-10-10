@@ -261,7 +261,12 @@ func (m *MockUCIRunner) GetSections(pkg string) ([]Section, error) {
 func (m *MockUCIRunner) EnsurePackage(pkg string) error {
 	cmd := fmt.Sprintf("ensure %s", pkg)
 	m.record(cmd)
-	return m.err(cmd)
+	if err := m.err(cmd); err != nil {
+		return err
+	}
+	// Creating the package file is what makes reading it succeed again.
+	delete(m.Errors, fmt.Sprintf("sections %s", pkg))
+	return nil
 }
 
 func (m *MockUCIRunner) Add(pkg, sectionType, name string) (string, error) {
