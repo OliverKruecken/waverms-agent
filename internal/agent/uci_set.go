@@ -78,6 +78,24 @@ func findUCISection(sections []uci.Section, key string) *uci.Section {
 	return uci.FindSectionByID(sections, key)
 }
 
+// getSectionsForWrite fetches config's sections for a subcommand that is about
+// to add or change something. A package with no file on the device (e.g. luci on
+// an image without LuCI) makes libuci fail with "Entry not found" (ubus exit
+// 252) and can't take a new section either, so on a read failure the empty
+// package file is created and the read retried — the same recovery config_apply
+// does (see apply/applier.go). Read-only and delete subcommands call GetSections
+// directly: they must not create anything.
+func getSectionsForWrite(runner uci.UCIRunner, config string) ([]uci.Section, error) {
+	sections, err := runner.GetSections(config)
+	if err == nil {
+		return sections, nil
+	}
+	if ensureErr := runner.EnsurePackage(config); ensureErr != nil {
+		return nil, fmt.Errorf("ensure package %s: %w (after: %v)", config, ensureErr, err)
+	}
+	return runner.GetSections(config)
+}
+
 // runUCISetCommand executes one parsed uci_set subcommand against runner,
 // returning text output (mirroring the uci CLI's own stdout convention where
 // applicable — e.g. "add" returns the new section id, "get" returns the
@@ -88,6 +106,9 @@ func runUCISetCommand(runner uci.UCIRunner, subcmd string, rest []string) (strin
 	case "add":
 		if len(rest) != 2 {
 			return "", fmt.Errorf("add: want \"<config> <type>\", got %d arg(s)", len(rest))
+		}
+		if _, err := getSectionsForWrite(runner, rest[0]); err != nil {
+			return "", fmt.Errorf("add %s: %w", rest[0], err)
 		}
 		return runner.Add(rest[0], rest[1], "")
 	case "commit":
@@ -190,7 +211,7 @@ func runUCISet(runner uci.UCIRunner, rest []string) error {
 	if err != nil {
 		return err
 	}
-	sections, err := runner.GetSections(addr.Config)
+	sections, err := getSectionsForWrite(runner, addr.Config)
 	if err != nil {
 		return fmt.Errorf("set %s: %w", rest[0], err)
 	}
@@ -247,7 +268,11 @@ func modifyUCIList(runner uci.UCIRunner, rest []string, verb string, mutate func
 	if addr.Option == "" {
 		return fmt.Errorf("%s %s: option required", verb, rest[0])
 	}
-	sections, err := runner.GetSections(addr.Config)
+	getSections := runner.GetSections
+	if verb == "add_list" {
+		getSections = func(config string) ([]uci.Section, error) { return getSectionsForWrite(runner, config) }
+	}
+	sections, err := getSections(addr.Config)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", verb, rest[0], err)
 	}

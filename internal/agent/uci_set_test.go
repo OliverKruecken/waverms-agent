@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/OliverKruecken/waverms-agent/internal/uci"
@@ -244,4 +245,70 @@ func TestModifyUCIList_MissingOptionErrors(t *testing.T) {
 	m := &uci.MockUCIRunner{}
 	err := modifyUCIList(m, []string{"network.lan=interface"}, "add_list", func(cur []string, v string) []string { return cur })
 	assert.Error(t, err)
+}
+
+// ── missing package file ────────────────────────────────────────────────────
+
+func missingPackage(pkg string) *uci.MockUCIRunner {
+	return &uci.MockUCIRunner{Errors: map[string]error{"sections " + pkg: errors.New("exit status 252")}}
+}
+
+func TestRunUCISet_MissingPackage_IsCreatedFirst(t *testing.T) {
+	mock := missingPackage("luci")
+
+	require.NoError(t, runUCISet(mock, []string{"luci.main=core"}))
+
+	assert.Contains(t, mock.Calls, "ensure luci")
+	assert.Contains(t, mock.Calls, "add luci core main")
+}
+
+func TestRunUCISet_ExistingPackage_IsNotRecreated(t *testing.T) {
+	mock := &uci.MockUCIRunner{}
+
+	require.NoError(t, runUCISet(mock, []string{"luci.main=core"}))
+
+	assert.NotContains(t, mock.Calls, "ensure luci")
+}
+
+func TestRunUCISet_EnsurePackageFailure_IsReported(t *testing.T) {
+	mock := missingPackage("luci")
+	mock.Errors["ensure luci"] = errors.New("read-only file system")
+
+	err := runUCISet(mock, []string{"luci.main=core"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ensure package luci")
+	assert.NotContains(t, mock.Calls, "add luci core main")
+}
+
+func TestRunUCISetCommand_AddOnMissingPackage_CreatesIt(t *testing.T) {
+	mock := missingPackage("luci")
+
+	_, err := runUCISetCommand(mock, "add", []string{"luci", "core"})
+	require.NoError(t, err)
+
+	assert.Contains(t, mock.Calls, "ensure luci")
+	assert.Contains(t, mock.Calls, "add luci core")
+}
+
+func TestModifyUCIList_AddListOnMissingPackage_CreatesIt(t *testing.T) {
+	mock := missingPackage("luci")
+
+	err := modifyUCIList(mock, []string{"luci.main.opt=v"}, "add_list", func(cur []string, v string) []string { return append(cur, v) })
+	require.NoError(t, err)
+
+	assert.Contains(t, mock.Calls, "ensure luci")
+}
+
+func TestUCISet_ReadAndDeleteOnMissingPackage_DoNotCreateIt(t *testing.T) {
+	mock := missingPackage("luci")
+
+	_, getErr := runUCISetCommand(mock, "get", []string{"luci.main.opt"})
+	delErr := runUCIDelete(mock, []string{"luci.main"})
+	listErr := modifyUCIList(mock, []string{"luci.main.opt=v"}, "del_list", func(cur []string, v string) []string { return cur })
+
+	assert.Error(t, getErr)
+	assert.Error(t, delErr)
+	assert.Error(t, listErr)
+	assert.NotContains(t, mock.Calls, "ensure luci")
 }
