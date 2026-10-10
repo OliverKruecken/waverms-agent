@@ -24,6 +24,11 @@ type UCIRunner interface {
 	// "doesn't exist yet means empty" contract have historically treated any
 	// error here as "no sections."
 	GetSections(pkg string) ([]Section, error)
+	// EnsurePackage creates an empty package file for pkg if the device has none;
+	// an existing package is left untouched. libuci can't add a section to a
+	// package without a file, so this has to run before the first Add for a
+	// package the device may not ship (see EnsurePackageFile).
+	EnsurePackage(pkg string) error
 	// Add creates a new section of sectionType in pkg. If name is non-empty
 	// the section is created with that name (idempotent-creation upsert
 	// semantics belong to the caller, which should only call Add when it has
@@ -96,6 +101,10 @@ func (r *RealUCIRunner) GetSections(pkg string) ([]Section, error) {
 		return nil, err
 	}
 	return decodeUbusUCIGet(out)
+}
+
+func (r *RealUCIRunner) EnsurePackage(pkg string) error {
+	return EnsurePackageFile(configDir, pkg)
 }
 
 func (r *RealUCIRunner) Add(pkg, sectionType, name string) (string, error) {
@@ -247,6 +256,12 @@ func (m *MockUCIRunner) GetSections(pkg string) ([]Section, error) {
 		return m.Sections[pkg], nil
 	}
 	return nil, nil
+}
+
+func (m *MockUCIRunner) EnsurePackage(pkg string) error {
+	cmd := fmt.Sprintf("ensure %s", pkg)
+	m.record(cmd)
+	return m.err(cmd)
 }
 
 func (m *MockUCIRunner) Add(pkg, sectionType, name string) (string, error) {

@@ -2,6 +2,7 @@ package apply_test
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -682,4 +683,74 @@ func TestApply_NamedSection_NoRetypeWhenExistingTypeMatches(t *testing.T) {
 		assert.NotContains(t, c, "set-type", "type already matches — no retype call expected")
 	}
 	assert.NotContains(t, mock.Calls, "add network interface wan")
+}
+
+const luciConfig = `{
+  "luci": {
+    ".mode": "merge",
+    "core": [
+      { ".name": "main", "lang": "auto" }
+    ]
+  }
+}`
+
+func indexOf(calls []string, want string) int {
+	for i, c := range calls {
+		if c == want {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestApply_MissingPackage_IsCreatedBeforeStaging(t *testing.T) {
+	mock := &uci.MockUCIRunner{Errors: map[string]error{"sections luci": errors.New("exit status 252")}}
+	a := apply.New(mock)
+
+	committed, err := a.Apply(json.RawMessage(luciConfig))
+	require.NoError(t, err)
+
+	ensure := indexOf(mock.Calls, "ensure luci")
+	add := indexOf(mock.Calls, "add luci core main")
+	require.GreaterOrEqual(t, ensure, 0, "expected the missing package to be created")
+	require.GreaterOrEqual(t, add, 0)
+	assert.Less(t, ensure, add, "the package must exist before the first add")
+	assert.Equal(t, []string{"luci"}, committed)
+}
+
+func TestApply_ExistingPackage_IsNotRecreated(t *testing.T) {
+	mock := &uci.MockUCIRunner{}
+	a := apply.New(mock)
+
+	_, err := a.Apply(json.RawMessage(luciConfig))
+	require.NoError(t, err)
+
+	assert.Equal(t, -1, indexOf(mock.Calls, "ensure luci"))
+}
+
+func TestApply_DeleteOnlyForMissingPackage_DoesNotCreateIt(t *testing.T) {
+	mock := &uci.MockUCIRunner{Errors: map[string]error{"sections luci": errors.New("exit status 252")}}
+	a := apply.New(mock)
+
+	_, err := a.Apply(json.RawMessage(`{"luci": {".delete": true}}`))
+	require.NoError(t, err)
+
+	assert.Equal(t, -1, indexOf(mock.Calls, "ensure luci"))
+}
+
+func TestApply_EnsurePackageFailure_FailsAndRevertsStagedPackages(t *testing.T) {
+	mock := &uci.MockUCIRunner{Errors: map[string]error{
+		"sections luci": errors.New("exit status 252"),
+		"ensure luci":   errors.New("read-only file system"),
+	}}
+	a := apply.New(mock)
+
+	cfg := `{"firewall": {"zone": [{".name": "lan", "name": "lan"}]}, "luci": {"core": [{".name": "main"}]}}`
+	_, err := a.Apply(json.RawMessage(cfg))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ensure package luci")
+
+	assert.Contains(t, mock.Calls, "revert firewall")
+	assert.Equal(t, -1, indexOf(mock.Calls, "add luci core main"))
+	assert.Equal(t, -1, indexOf(mock.Calls, "commit firewall"), "nothing may be committed after a staging failure")
 }
